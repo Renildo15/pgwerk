@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from typing import Any
+
 from datetime import datetime
 
 import click
@@ -36,7 +38,7 @@ def dashboard(app: str, interval: int, queue: str | None) -> None:
 
     wrk_app = load_app(app)
 
-    async def _fetch(connect, t):
+    async def _fetch(connect: Any, t: dict[str, Any]) -> tuple[dict[Any, Any], list[Any], list[Any]]:
         async with await connect() as conn, conn.cursor() as cur:
             await cur.execute(
                 SQL("""
@@ -79,7 +81,7 @@ def dashboard(app: str, interval: int, queue: str | None) -> None:
 
         return counts, workers, recent
 
-    def _build(counts, workers, recent, last_refresh):
+    def _build(counts: dict[Any, Any], workers: list[Any], recent: list[Any], last_refresh: str) -> Group:
         total = sum(counts.values())
 
         status_table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", padding=(0, 1))
