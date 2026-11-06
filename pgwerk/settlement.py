@@ -218,6 +218,8 @@ class Settlement:
             cur,
             job.id,
             fence.worker_id,
+            # A worker closes its own attempt; the sweeper closes whatever is still running.
+            fence.attempt if fence.worker_id is not None else None,
             status=_EXECUTION_STATUS[t.status],
             result_json=t.result_json if t.status == JobStatus.Complete else None,
             error=t.error if t.status != JobStatus.Complete else None,

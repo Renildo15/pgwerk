@@ -20,6 +20,14 @@ class TestRunSync:
         assert done.status == JobStatus.Complete
         assert done.result == 7
 
+    async def test_run_sync_closes_its_execution_row(self, app):
+        done = await app.enqueue(add, 3, 4, _sync=True)
+        failed = await app.enqueue(fail_always, _sync=True)
+        [ok_exec] = await app.get_executions(done.id)
+        [fail_exec] = await app.get_executions(failed.id)
+        assert ok_exec.status.value == "complete"
+        assert fail_exec.status.value == "failed"
+
     async def test_run_sync_async_function(self, app):
         done = await app.enqueue(async_add, 5, 6, _sync=True)
         assert done is not None

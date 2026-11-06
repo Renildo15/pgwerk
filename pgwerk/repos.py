@@ -587,21 +587,37 @@ class JobRepository:
         cur: Any,
         job_id: str,
         worker_id: str | None,
+        attempt: int | None,
         *,
         status: str,
         result_json: str | None,
         error: str | None,
     ) -> None:
-        """Close the job's ``running`` execution row(s), optionally only the worker's."""
+        """Close the job's ``running`` execution row for this attempt.
+
+        With *worker_id*, only that worker's execution of *attempt* is closed, or one
+        with no worker id (``_sync=True`` executions, since the sync worker isn't a
+        registered worker). The steal path can create a second execution with the
+        same attempt number, so the attempt alone isn't enough. With
+        ``worker_id=None`` (the sweeper), every ``running`` execution is closed.
+        """
         await cur.execute(
             SQL("""
                 UPDATE {executions}
                 SET status = %(status)s, result = %(result)s, error = %(error)s, completed_at = NOW()
                 WHERE job_id = %(jid)s
                   AND status = 'running'
-                  AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid)
+                  AND (%(attempt)s::int IS NULL OR attempt = %(attempt)s::int)
+                  AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid OR worker_id IS NULL)
             """).format(executions=self._t["executions"]),
-            {"jid": job_id, "wid": worker_id, "status": status, "result": result_json, "error": error},
+            {
+                "jid": job_id,
+                "wid": worker_id,
+                "attempt": attempt,
+                "status": status,
+                "result": result_json,
+                "error": error,
+            },
         )
 
     async def release_claim(self, cur: Any, job_id: str, worker_id: str | None) -> None:
