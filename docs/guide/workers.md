@@ -171,6 +171,9 @@ attempt's late result is rejected, and at its next renewal the old worker cancel
 without writing anything. A worker that dies is noticed within one lease TTL, not after
 `max_active_secs`. `max_active_secs` now only applies to jobs claimed by workers older than
 schema 8, during a rolling deploy.
+- **deletes rows whose retention ran out.** Finished jobs with `_result_ttl`/`_failure_ttl` are
+  deleted once it passes (up to 1000 per pass, oldest first), along with their executions and
+  stopped worker rows. Turn it off with `WerkConfig(purge_expired=False)`.
 - **expires unstarted jobs.** A `queued` or `scheduled` job whose `_ttl` ran out ends `aborted`
   with `error = 'expired'`: dependents settle, `failure_mode="delete"` applies, `on_stopped` runs.
 - **settles stranded dependents.** A `waiting` job whose dependencies have all settled, but

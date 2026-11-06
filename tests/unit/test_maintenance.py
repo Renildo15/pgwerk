@@ -14,6 +14,8 @@ def _app(**overrides):
     app.config.sweep_interval = 60.0
     app.sweep = AsyncMock(return_value=["a", "b"])
     app.expire_unstarted = AsyncMock(return_value=4)
+    app.purge_expired = AsyncMock(return_value=5)
+    app.config.purge_expired = True
     app.reconcile_waiting = AsyncMock(return_value=ReconcileResult(queued=2, failed=1))
     app.reschedule_stuck = AsyncMock(return_value=3)
     for name, value in overrides.items():
@@ -28,6 +30,7 @@ class TestRunOnce:
         assert report.reconciled == ReconcileResult(queued=2, failed=1)
         assert report.rescheduled == 3
         assert report.expired == 4
+        assert report.purged == 5
         assert report.errors == {}
 
     async def test_failing_task_does_not_stop_the_others(self):
@@ -52,3 +55,11 @@ class TestRun:
         m.stop()
         await asyncio.wait_for(task, timeout=1.0)
         assert m.app.sweep.await_count >= 2
+
+
+async def test_purge_is_skipped_when_disabled():
+    app = _app()
+    app.config.purge_expired = False
+    report = await Maintenance(app).run_once()
+    app.purge_expired.assert_not_awaited()
+    assert report.purged == 0

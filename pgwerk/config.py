@@ -54,6 +54,9 @@ class WerkConfig:
         maintenance: Run the maintenance pass (sweep, stranded ``waiting`` job
             reconciliation, rescheduling) inside the API process, every
             ``sweep_interval``. Lets stuck jobs recover with no worker running.
+        purge_expired: Let maintenance delete finished jobs whose ``_result_ttl``
+            or ``_failure_ttl`` ran out (and stopped worker rows past their
+            expiry). Set ``False`` to keep every row.
         local_lease_ttl: Seconds a local worker's claim on a job stays valid without
             renewal, for jobs without ``heartbeat_secs`` (which is used instead). If
             the worker stops renewing, the sweep recovers the job after this long.
@@ -111,6 +114,9 @@ class WerkConfig:
     # Retry behavior
     default_retry_backoff: bool = True
 
+    # Maintenance
+    purge_expired: bool = True
+
     # Leases
     local_lease_ttl: int = 300
     remote_lease_ttl: int = 60
@@ -151,6 +157,7 @@ class WerkConfig:
             api_token=os.environ.get("PGWERK_API_TOKEN"),
             maintenance=_bool("PGWERK_MAINTENANCE", False),
             default_retry_backoff=_bool("PGWERK_DEFAULT_RETRY_BACKOFF", True),
+            purge_expired=_bool("PGWERK_PURGE_EXPIRED", True),
             local_lease_ttl=_int("PGWERK_LOCAL_LEASE_TTL", 300),
             remote_lease_ttl=_int("PGWERK_REMOTE_LEASE_TTL", 60),
             default_max_lost=_int("PGWERK_DEFAULT_MAX_LOST", 3),
@@ -180,6 +187,7 @@ class WerkConfig:
             os.environ["PGWERK_API_TOKEN"] = self.api_token
         os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
         os.environ["PGWERK_DEFAULT_RETRY_BACKOFF"] = "true" if self.default_retry_backoff else "false"
+        os.environ["PGWERK_PURGE_EXPIRED"] = "true" if self.purge_expired else "false"
         os.environ["PGWERK_LOCAL_LEASE_TTL"] = str(self.local_lease_ttl)
         os.environ["PGWERK_REMOTE_LEASE_TTL"] = str(self.remote_lease_ttl)
         os.environ["PGWERK_DEFAULT_MAX_LOST"] = str(self.default_max_lost)

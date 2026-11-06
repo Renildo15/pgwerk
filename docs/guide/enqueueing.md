@@ -108,7 +108,7 @@ await app.enqueue(my_func, _meta={"source": "api", "request_id": "abc"})
 # Expire an unstarted job after 60 seconds
 await app.enqueue(my_func, _ttl=60)
 
-# Keep the completed-job row for 1 hour
+# Keep the completed-job row for 1 hour, then let maintenance delete it
 await app.enqueue(my_func, _result_ttl=3600)
 
 # Keep the failed-job row for 24 hours

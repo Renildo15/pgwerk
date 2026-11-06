@@ -922,6 +922,41 @@ class JobRepository:
             )
             return cur.rowcount
 
+    async def purge_expired(self, limit: int = 1000) -> int:
+        """Delete finished jobs whose retention (``result_ttl``/``failure_ttl``) ran out.
+
+        Oldest first, at most *limit* per call. Rows are deleted through
+        :meth:`_delete_settling_dependents`, so a dependent is never stranded, and
+        their executions cascade. Unstarted jobs are never matched: their
+        ``expires_at`` is the ``_ttl`` deadline, handled by ``expire_unstarted``.
+
+        Returns:
+            Number of job rows deleted.
+        """
+        async with await self._connect() as conn:
+            cur = await conn.execute(
+                SQL("""
+                    SELECT id::text FROM {jobs}
+                    WHERE status IN ('complete', 'failed', 'aborted')
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= NOW()
+                    ORDER BY expires_at
+                    LIMIT %(limit)s
+                """).format(jobs=self._t["jobs"]),
+                {"limit": limit},
+            )
+            ids = [r[0] for r in await cur.fetchall()]
+        if not ids:
+            return 0
+        # Re-check under the delete's transaction: a row may have been requeued since.
+        return await self._delete_settling_dependents(
+            SQL(
+                "id = ANY(%(ids)s::uuid[]) AND status IN ('complete', 'failed', 'aborted') "
+                "AND expires_at IS NOT NULL AND expires_at <= NOW()"
+            ),
+            {"ids": ids},
+        )
+
     async def purge(self, statuses: list[str], older_than_days: int | None = None, queue: str | None = None) -> int:
         """Delete jobs by status, settling their ``waiting`` dependents first.
 
@@ -1155,6 +1190,26 @@ class WorkerRepository:
                 """).format(worker=self._t["worker"]),
                 {"id": worker_id},
             )
+
+    async def purge_stopped(self, limit: int = 1000) -> int:
+        """Delete stopped worker rows whose ``expires_at`` passed.
+
+        Their executions keep the history with ``worker_id = NULL``.
+        """
+        async with await self._connect() as conn, conn.cursor() as cur:
+            await cur.execute(
+                SQL("""
+                    DELETE FROM {worker}
+                    WHERE id IN (
+                        SELECT id FROM {worker}
+                        WHERE status = 'stopped' AND expires_at IS NOT NULL AND expires_at <= NOW()
+                        LIMIT %(limit)s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                """).format(worker=self._t["worker"]),
+                {"limit": limit},
+            )
+            return cur.rowcount
 
     async def update_heartbeat(self, worker_id: str) -> None:
         async with await self._connect() as conn, conn.transaction():

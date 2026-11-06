@@ -904,6 +904,26 @@ class Werk:
             logger.info("werk: expired %d job(s) whose _ttl ran out before they started", expired)
         return expired
 
+    async def purge_expired(self, limit: int = 1000) -> int:
+        """Delete finished jobs whose ``_result_ttl``/``_failure_ttl`` ran out.
+
+        Also deletes stopped worker rows past their ``expires_at``. Runs as part of
+        maintenance unless ``config.purge_expired`` is ``False``. At most *limit* rows
+        of each kind per call, oldest first, so a large backlog drains over several
+        passes. Jobs waiting on a deleted job are settled first.
+
+        Args:
+            limit: Maximum number of job rows (and of worker rows) to delete.
+
+        Returns:
+            Number of job rows deleted.
+        """
+        jobs = await self._job_repo.purge_expired(limit=limit)
+        workers = await self._worker_repo.purge_stopped(limit=limit)
+        if jobs or workers:
+            logger.info("werk: deleted %d expired job(s) and %d stopped worker(s)", jobs, workers)
+        return jobs
+
     async def reconcile_waiting(self, limit: int = 500) -> ReconcileResult:
         """Settle ``waiting`` jobs whose dependencies have all settled.
 

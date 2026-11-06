@@ -42,6 +42,8 @@ class MaintenanceReport:
     """Stranded ``waiting`` jobs that were settled."""
     expired: int = 0
     """Unstarted jobs aborted because their ``_ttl`` ran out."""
+    purged: int = 0
+    """Finished jobs deleted because their retention ran out."""
     rescheduled: int = 0
     """Due ``scheduled`` jobs moved to ``queued``."""
     errors: dict[str, str] = field(default_factory=dict)
@@ -49,7 +51,8 @@ class MaintenanceReport:
 
 
 class Maintenance:
-    """Runs sweep, ``_ttl`` expiry, waiting-job reconciliation and rescheduling on an interval.
+    """Runs sweep, ``_ttl`` expiry, expired-row purge, waiting-job reconciliation and
+    rescheduling on an interval.
 
     Args:
         app: Connected :class:`~pgwerk.app.Werk` instance.
@@ -76,6 +79,13 @@ class Maintenance:
         except Exception as exc:
             report.errors["expire_unstarted"] = str(exc)
             logger.warning("maintenance: expiring unstarted jobs failed: %s", exc)
+
+        if self.app.config.purge_expired:
+            try:
+                report.purged = await self.app.purge_expired()
+            except Exception as exc:
+                report.errors["purge_expired"] = str(exc)
+                logger.warning("maintenance: purging expired rows failed: %s", exc)
 
         try:
             report.reconciled = await self.app.reconcile_waiting()

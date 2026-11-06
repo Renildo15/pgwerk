@@ -75,6 +75,7 @@ def maintain(
                 click.echo(
                     f"swept={len(report.swept)} "
                     f"expired={report.expired} "
+                    f"purged={report.purged} "
                     f"reconciled_queued={report.reconciled.queued} "
                     f"reconciled_failed={report.reconciled.failed} "
                     f"rescheduled={report.rescheduled}"
