@@ -855,12 +855,15 @@ class Werk:
         return await self._job_repo.abort(job_id)
 
     async def touch_job(self, job_id: str) -> None:
-        """Extend the heartbeat deadline for a long-running job.
+        """Extend an active job's lease (its heartbeat deadline).
+
+        Workers renew the leases of the jobs they run on their own; this is for
+        code that needs to extend one explicitly.
 
         Args:
             job_id: ID of the active job to touch.
         """
-        await self._job_repo.touch(job_id)
+        await self._job_repo.touch(job_id, lease_ttl=self.config.local_lease_ttl)
 
     async def sweep(self) -> list[str]:
         """Recover stuck jobs whose worker stopped making progress.

@@ -22,6 +22,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Schema version 8** (applied automatically on connect): `lease_id`, `lease_expires_at`, `lost_count` and `max_lost` columns on the jobs table, and partial indexes on `lease_expires_at` (active leases) and `expires_at`. Workers from earlier versions keep running against it during a rolling deploy.
 - Each attempt now gets a **lease**: its `lease_id` is the attempt's execution id, and every write that settles or requeues the attempt is fenced on it. A late result from an attempt that was swept and claimed again, even by the same worker, can no longer settle the new attempt.
 - Dequeue no longer steals `active` jobs whose heartbeat went stale. Those jobs are recovered by the sweep only, so attempts are counted in one place. The steal path also never counted an attempt, so a job that kept killing its worker was stolen forever.
+- Workers renew the leases of all their running jobs in one `UPDATE` (every `heartbeat_interval`, or a quarter of the shortest lease TTL if sooner), replacing the per-job heartbeat task. `heartbeat_secs` is now the job's lease TTL; jobs without it use `local_lease_ttl` (300s). `Werk.touch_job()` extends the job's current lease.
+- A job whose lease is gone when its worker renews (recovered by the sweep, or now owned by another attempt) is cancelled, and its worker writes nothing for it.
 - This release declares `max_compatible_db_version = 10`: it refuses to connect to a database whose schema is newer than 10. Earlier releases accepted any newer schema. Later breaking migrations rely on this bound to stop old code from running against them.
 
 ### Fixed

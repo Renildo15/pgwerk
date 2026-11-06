@@ -149,7 +149,8 @@ Permanently delete a job row.
 
 #### `touch_job(job_id) → None`
 
-Extend the heartbeat deadline for a long-running job.
+Extend an active job's lease (its heartbeat deadline). Workers renew the leases of the jobs they
+run on their own, so this is only for code that needs to extend one explicitly.
 
 #### `get_executions(job_id) → list[JobExecution]`
 

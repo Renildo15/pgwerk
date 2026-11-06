@@ -344,11 +344,19 @@ class JobRepository:
             )
             return await cur.fetchone() is not None
 
-    async def touch(self, job_id: str) -> None:
+    async def touch(self, job_id: str, lease_ttl: int = 300) -> None:
+        """Extend an active job's current lease and mark it touched."""
         async with await self._connect() as conn, conn.transaction():
             await conn.execute(
-                SQL("UPDATE {jobs} SET touched_at = NOW() WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                {"id": job_id},
+                SQL("""
+                    UPDATE {jobs}
+                    SET touched_at = NOW(),
+                        lease_expires_at = CASE WHEN lease_id IS NULL THEN lease_expires_at
+                                                ELSE NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second'
+                                           END
+                    WHERE id = %(id)s AND status IN ('active', 'aborting')
+                """).format(jobs=self._t["jobs"]),
+                {"id": job_id, "ttl": lease_ttl},
             )
 
     async def requeue(self, job_id: str) -> bool:
@@ -1215,6 +1223,39 @@ class WorkerRepository:
     # ------------------------------------------------------------------
     # Ack / Nack / Requeue
     # ------------------------------------------------------------------
+
+    async def renew_leases(self, worker_id: str, leases: dict[str, str], lease_ttl: int) -> set[str]:
+        """Renew every lease this worker holds, in one statement.
+
+        Args:
+            worker_id: The worker renewing.
+            leases: ``{job_id: lease_id}`` for the attempts it is running.
+            lease_ttl: TTL for jobs without ``heartbeat_secs``.
+
+        Returns:
+            IDs of the jobs whose lease was renewed. A job missing from the result
+            has lost its lease (swept, settled, or claimed by another attempt): its
+            attempt must stop without writing anything.
+        """
+        if not leases:
+            return set()
+        job_ids, lease_ids = zip(*leases.items())
+        async with await self._connect() as conn, conn.cursor() as cur:
+            await cur.execute(
+                SQL("""
+                    UPDATE {jobs} j
+                    SET lease_expires_at = NOW() + COALESCE(j.heartbeat_secs, %(ttl)s) * INTERVAL '1 second',
+                        touched_at = NOW()
+                    FROM unnest(%(job_ids)s::uuid[], %(lease_ids)s::uuid[]) AS l(job_id, lease_id)
+                    WHERE j.id = l.job_id
+                      AND j.lease_id = l.lease_id
+                      AND j.worker_id = %(wid)s::uuid
+                      AND j.status IN ('active', 'aborting')
+                    RETURNING j.id::text
+                """).format(jobs=self._t["jobs"]),
+                {"ttl": lease_ttl, "job_ids": list(job_ids), "lease_ids": list(lease_ids), "wid": worker_id},
+            )
+            return {r[0] for r in await cur.fetchall()}
 
     async def requeue_cancelled(self, worker_id: str, job: Job) -> None:
         """Put a job whose task was cancelled (e.g. on shutdown) back in the queue.

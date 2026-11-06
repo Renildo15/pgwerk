@@ -115,19 +115,15 @@ class BaseWorker(abc.ABC):
         self._active: set[asyncio.Task] = set()
         self._active_jobs: dict[str, asyncio.Task] = {}
         self._abort_requested: set[str] = set()
+        # Leases this worker still holds ({job_id: lease_id}); an entry is removed as
+        # soon as the attempt starts settling, so renewal never races its own settle.
+        self._leases: dict[str, str] = {}
+        self._lease_ttls: dict[str, int] = {}
+        self._lease_lost: set[str] = set()
         self._acknowledging_jobs: set[str] = set()
         self._wakeup = asyncio.Event()
         self._exception_handlers: list[Callable] = []
         self._rr_offset = 0
-
-    async def _job_heartbeat_loop(self, job_id: str, heartbeat_secs: int) -> None:
-        interval = max(1.0, heartbeat_secs / 2)
-        while True:
-            try:
-                await self.app.touch_job(job_id)
-            except Exception as exc:
-                logger.warning("Worker %s: job heartbeat error for %s: %s", self.name, job_id, exc)
-            await asyncio.sleep(interval)
 
     # ------------------------------------------------------------------
     # Hook registration
@@ -222,6 +218,7 @@ class BaseWorker(abc.ABC):
             side_tasks = [
                 asyncio.ensure_future(self._heartbeat_loop()),
                 asyncio.ensure_future(self._abort_loop()),
+                asyncio.ensure_future(self._lease_loop()),
             ]
             if self.maintenance:
                 side_tasks.append(asyncio.ensure_future(self._sweep_loop()))
@@ -330,6 +327,45 @@ class BaseWorker(abc.ABC):
     # ------------------------------------------------------------------
     # Abort loop
     # ------------------------------------------------------------------
+
+    def _lease_renew_interval(self) -> float:
+        """Renew at a quarter of the shortest TTL held, at most every heartbeat_interval."""
+        shortest = min(
+            (ttl for job_id, ttl in self._lease_ttls.items() if job_id in self._leases),
+            default=self.app.config.local_lease_ttl,
+        )
+        return max(0.25, min(float(self.heartbeat_interval), shortest / 4))
+
+    async def _lease_loop(self) -> None:
+        """Renew every held lease in one UPDATE; cancel the attempts that lost theirs."""
+        loop = asyncio.get_running_loop()
+        last_renewal = loop.time()
+        while self._running:
+            # Tick often and renew when due, so a job with a short TTL that starts
+            # just after a renewal isn't left waiting a long interval.
+            await asyncio.sleep(0.25)
+            held = dict(self._leases)
+            if not held or loop.time() - last_renewal < self._lease_renew_interval():
+                continue
+            last_renewal = loop.time()
+            try:
+                renewed = await self.app._worker_repo.renew_leases(self.id, held, self.app.config.local_lease_ttl)
+            except Exception as exc:
+                logger.warning("Worker %s: lease renewal error: %s", self.name, exc)
+                continue
+            for job_id in held.keys() - renewed:
+                if self._leases.get(job_id) != held[job_id]:
+                    continue  # started settling meanwhile; not a loss
+                self._leases.pop(job_id, None)
+                task = self._active_jobs.get(job_id)
+                if task is not None and not task.done():
+                    logger.warning(
+                        "Worker %s: job %s lost its lease (recovered elsewhere); cancelling it, nothing will be written",
+                        self.name,
+                        job_id,
+                    )
+                    self._lease_lost.add(job_id)
+                    task.cancel()
 
     async def _abort_loop(self) -> None:
         while self._running:
@@ -472,7 +508,9 @@ class BaseWorker(abc.ABC):
             job.max_attempts,
         )
         ctx = Context(app=self.app, worker=self, job=job)
-        heartbeat_task: asyncio.Task | None = None
+        if job.lease_id is not None:
+            self._leases[job.id] = job.lease_id
+            self._lease_ttls[job.id] = job.heartbeat_secs or self.app.config.local_lease_ttl
 
         try:
             try:
@@ -482,10 +520,12 @@ class BaseWorker(abc.ABC):
                     except Exception:
                         logger.exception("Worker %s: before_process hook error", self.name)
 
-                if job.heartbeat_secs:
-                    heartbeat_task = asyncio.create_task(self._job_heartbeat_loop(job.id, job.heartbeat_secs))
                 result = await self._execute(job, ctx)
             except asyncio.CancelledError:
+                self._leases.pop(job.id, None)
+                if job.id in self._lease_lost:
+                    # The sweep recovered the job; another attempt owns it now.
+                    return
                 if job.id in self._abort_requested:
                     await self._nack(job, "aborted", aborted=True)
                 else:
@@ -504,9 +544,11 @@ class BaseWorker(abc.ABC):
                     exc_info=True,
                 )
                 await self._invoke_exception_handlers(job, exc)
+                self._leases.pop(job.id, None)
                 await self._nack(job, traceback.format_exc())
                 return
 
+            self._leases.pop(job.id, None)
             self._acknowledging_jobs.add(job.id)
             # The handler has returned. Finish persistence even if a drain timeout
             # cancels this task; requeueing here would execute its side effects again.
@@ -521,13 +563,12 @@ class BaseWorker(abc.ABC):
         except asyncio.CancelledError:
             if job.id in self._acknowledging_jobs:
                 raise
-            await self._requeue_cancelled(job)
+            self._leases.pop(job.id, None)
+            if job.id not in self._lease_lost:
+                await self._requeue_cancelled(job)
         finally:
             try:
                 job_id_var.reset(token)
-                if heartbeat_task is not None:
-                    heartbeat_task.cancel()
-                    await asyncio.gather(heartbeat_task, return_exceptions=True)
                 for hook in self._after_process:
                     try:
                         await call_hook(hook, ctx)
@@ -536,6 +577,9 @@ class BaseWorker(abc.ABC):
             finally:
                 self._acknowledging_jobs.discard(job.id)
                 self._abort_requested.discard(job.id)
+                self._leases.pop(job.id, None)
+                self._lease_ttls.pop(job.id, None)
+                self._lease_lost.discard(job.id)
 
     @abc.abstractmethod
     async def _execute(self, job: Job, ctx: Context) -> Any:
