@@ -167,11 +167,29 @@ werk maintain --dsn postgresql://localhost/mydb --once
 Callbacks of jobs settled here run in this process, so run it where your task modules are
 importable.
 
+### `werk token` / `werk workers`
+
+Manage remote-worker access (experimental); see [Remote workers](../reference/remote.md).
+
+```bash
+werk token create --dsn "$DSN" --name gpu-box-1 --queues render   # printed once
+werk token list   --dsn "$DSN"
+werk token revoke --dsn "$DSN" <token-id>
+werk workers revoke --dsn "$DSN" <worker-id> [--drain]
+```
+
 ### `werk api`
 
 Start the REST API server (requires the `litestar` optional extra).
 
 ```bash
 pip install "pgwerk[api]"
-werk api myapp.tasks:app
+werk api --dsn "$DSN" --api-token "$ADMIN_TOKEN"
 ```
+
+| Option | Description |
+|---|---|
+| `--api-token` | Bearer token for `/api` |
+| `--maintenance / --no-maintenance` | Run the maintenance pass in this process (default: on with `--remote-workers`) |
+| `--remote-workers` | Serve the remote-worker protocol at `/remote/v1` (experimental; needs `--api-token` or `--no-api`) |
+| `--no-api` | Serve only the remote router: no `/api`, no dashboard |

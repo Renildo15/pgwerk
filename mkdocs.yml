@@ -29,6 +29,7 @@ nav:
     - Workers: reference/workers.md
     - Schemas: reference/schemas.md
     - Exceptions: reference/exceptions.md
+    - Remote workers: reference/remote.md
   - Changelog: changelog.md
 
 markdown_extensions:
