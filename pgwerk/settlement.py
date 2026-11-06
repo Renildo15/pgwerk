@@ -262,3 +262,38 @@ class Settlement:
         t = settled.transition
         if t is not None and t.callback:
             await invoke_callback(t.callback, job, timeout=t.callback_timeout)
+
+    async def sweep(self, max_active_secs: int) -> list[str]:
+        """Recover stuck jobs whose worker stopped making progress.
+
+        Each stuck job is locked, then:
+
+        - ``aborting``: settles as aborted (dependents, ``failure_mode``,
+          ``failure_ttl``, ``on_stopped``). It is never requeued.
+        - ``active`` at the attempt cap: settles as a failure with
+          ``error = 'swept'``, like any other failure (``failure_mode``,
+          ``failure_ttl``, dependents, ``on_failure``).
+        - ``active`` under the cap: requeued at once.
+
+        Callbacks run after the transaction commits.
+
+        Returns:
+            IDs of every job the sweep touched.
+        """
+        settled: list[tuple[Job, Settled]] = []
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            stuck = await self._jobs.lock_stuck(cur, max_active_secs)
+            requeue: list[Job] = []
+            for job in stuck:
+                fence = Fence(job.id, worker_id=None, attempt=job.attempts)
+                if job.status == JobStatus.Aborting:
+                    settled.append((job, await self.apply(cur, job, fence, Outcome("abort"))))
+                elif job.attempts >= job.max_attempts:
+                    settled.append((job, await self.apply(cur, job, fence, Outcome("fail", error="swept"))))
+                else:
+                    requeue.append(job)
+            await self._jobs.requeue_stuck(cur, requeue)
+
+        for job, result in settled:
+            await self.run_callback(job, result)
+        return [job.id for job in stuck]

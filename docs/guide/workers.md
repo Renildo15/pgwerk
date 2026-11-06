@@ -148,8 +148,9 @@ Handlers are called in reverse push order (most recently pushed first). Use `pop
 Every `sweep_interval` seconds a maintenance pass:
 
 - **recovers stuck jobs** (the sweep). An `active` job whose timeout, heartbeat or
-  `max_active_secs` window has elapsed is requeued, or failed with `error = 'swept'` at its
-  attempt cap. An `aborting` job in the same situation ends `aborted` and is never requeued:
+  `max_active_secs` window has elapsed is requeued. At its attempt cap it fails with
+  `error = 'swept'` like any other failure: `on_failure` runs, `failure_mode="delete"` applies
+  and `failure_ttl` sets its expiry. An `aborting` job in the same situation ends `aborted` and is never requeued:
   its dependents settle, `failure_mode="delete"` removes it, and `on_stopped` runs.
 - **settles stranded dependents.** A `waiting` job whose dependencies have all settled, but
   that was never moved on (for example because a dependency was settled outside pgwerk), is

@@ -254,3 +254,72 @@ class TestSweepAborting:
             await app.get_job(parent.id)
         assert _callback_log == [("stopped", parent.id)]
         assert (await app.get_job(child.id)).status == JobStatus.Failed
+
+
+async def _make_stuck_at_cap(app, job_id: str) -> None:
+    async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+        await conn.execute(
+            SQL("""
+                UPDATE {jobs}
+                SET status = 'active', attempts = 1, max_attempts = 1,
+                    started_at = NOW() - INTERVAL '2 hour', worker_id = gen_random_uuid()
+                WHERE id = %s
+            """).format(jobs=app._t["jobs"]),
+            (job_id,),
+        )
+
+
+class TestSweptFailureSettlement:
+    async def test_runs_on_failure(self, app):
+        from .tasks import on_failure
+        from .tasks import _callback_log
+
+        job = await app.enqueue(noop, _retry=1, _on_failure=on_failure)
+        await _make_stuck_at_cap(app, job.id)
+        await app.sweep()
+
+        row = await app.get_job(job.id)
+        assert (row.status, row.error) == (JobStatus.Failed, "swept")
+        assert _callback_log == [("failure", job.id)]
+
+    async def test_sets_expiry_from_failure_ttl(self, app):
+        job = await app.enqueue(noop, _retry=1, _failure_ttl=600)
+        await _make_stuck_at_cap(app, job.id)
+        await app.sweep()
+
+        row = await app.get_job(job.id)
+        assert row.expires_at is not None
+        assert row.expires_at > row.completed_at
+
+    async def test_failure_mode_delete_deletes_and_settles_dependents(self, app):
+        from pgwerk.exceptions import JobNotFound
+
+        parent = await app.enqueue(noop, _retry=1, _failure_mode="delete")
+        child = await app.enqueue(noop, _depends_on=parent)
+        await _make_stuck_at_cap(app, parent.id)
+        await app.sweep()
+
+        with pytest.raises(JobNotFound):
+            await app.get_job(parent.id)
+        child_row = await app.get_job(child.id)
+        assert (child_row.status, child_row.error) == (JobStatus.Failed, "dependency failed")
+
+    async def test_under_cap_is_requeued_without_callbacks(self, app):
+        from .tasks import on_failure
+        from .tasks import _callback_log
+
+        job = await app.enqueue(noop, _retry=3, _on_failure=on_failure)
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("""
+                    UPDATE {jobs}
+                    SET status = 'active', attempts = 1,
+                        started_at = NOW() - INTERVAL '2 hour', worker_id = gen_random_uuid()
+                    WHERE id = %s
+                """).format(jobs=app._t["jobs"]),
+                (job.id,),
+            )
+        await app.sweep()
+
+        assert (await app.get_job(job.id)).status == JobStatus.Queued
+        assert _callback_log == []

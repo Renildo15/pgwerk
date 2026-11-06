@@ -22,7 +22,6 @@ from .repos import StatsRepository
 from .repos import WorkerRepository
 from .repos import ScheduleRepository
 from .utils import fn_path
-from .utils import invoke_callback
 from .utils import normalize_retry
 from .utils import normalize_callback
 from .utils import normalize_failure_mode
@@ -857,20 +856,19 @@ class Werk:
         """Recover stuck jobs whose worker stopped making progress.
 
         A job is considered stuck when its timeout, heartbeat or ``max_active_secs``
-        window has elapsed. Stuck ``active`` jobs are requeued, or failed at the
-        attempt cap. Stuck ``aborting`` jobs settle as ``aborted`` (never requeued),
-        and their ``on_stopped`` callback runs here, after the sweep commits.
+        window has elapsed. Stuck ``active`` jobs are requeued; at the attempt cap
+        they fail with ``error = 'swept'`` like any other failure (``failure_mode``,
+        ``failure_ttl``, dependents and ``on_failure`` apply). Stuck ``aborting`` jobs
+        settle as ``aborted`` and are never requeued. Callbacks run here, after the
+        sweep commits, so their modules must be importable in this process.
 
         Returns:
             IDs of every job the sweep touched.
         """
-        result = await self._job_repo.sweep(self.max_active_secs)
-        if result.job_ids:
-            logger.info("werk: sweep recovered %d stuck job(s): %s", len(result.job_ids), result.job_ids)
-        for job in result.aborted:
-            if job.on_stopped:
-                await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
-        return result.job_ids
+        swept = await self._settlement.sweep(self.max_active_secs)
+        if swept:
+            logger.info("werk: sweep recovered %d stuck job(s): %s", len(swept), swept)
+        return swept
 
     async def reconcile_waiting(self, limit: int = 500) -> ReconcileResult:
         """Settle ``waiting`` jobs whose dependencies have all settled.

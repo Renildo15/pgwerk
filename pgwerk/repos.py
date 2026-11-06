@@ -40,17 +40,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SweepResult:
-    """Outcome of :meth:`JobRepository.sweep`."""
-
-    job_ids: list[str]
-    """Every job the sweep touched (requeued, failed or aborted)."""
-    aborted: list[Job]
-    """Jobs that were ``aborting`` and settled as ``aborted``, as they were before any
-    ``failure_mode=delete``. The caller runs their ``on_stopped`` callbacks."""
-
-
-@dataclasses.dataclass
 class ReconcileResult:
     """Outcome of :meth:`JobRepository.reconcile_waiting`."""
 
@@ -381,135 +370,59 @@ class JobRepository:
                                AND started_at + %(max_active_secs)s * INTERVAL '1 second' < NOW())
     """
 
-    async def sweep(self, max_active_secs: int) -> SweepResult:
-        """Recover stuck ``active`` and ``aborting`` jobs.
+    async def lock_stuck(self, cur: Any, max_active_secs: int) -> list[Job]:
+        """Lock stuck ``active``/``aborting`` jobs, skipping rows locked elsewhere.
 
-        - ``aborting`` jobs settle as ``aborted`` and are never requeued: the abort was
-          requested, and the worker that should have honored it is gone. Their
-          dependents settle, and ``failure_mode=delete`` deletes the row after that.
-        - ``active`` jobs are requeued, or failed with ``error = 'swept'`` at the
-          attempt cap.
-
-        Callbacks are not run here; the caller runs ``on_stopped`` for
-        :attr:`SweepResult.aborted` after this transaction commits.
+        A job is stuck when its timeout, heartbeat or max-active window has elapsed.
         """
-        swept_ids: list[str] = []
-        aborted: list[Job] = []
-        notify_queues: set[str] = set()
-        params = {"max_active_secs": max_active_secs}
+        await cur.execute(
+            SQL(
+                """
+                SELECT """
+                + JOB_COLS
+                + """
+                FROM {jobs}
+                WHERE status IN ('active', 'aborting')
+                  AND ("""
+                + self._STUCK_PREDICATE
+                + """)
+                FOR UPDATE SKIP LOCKED
+                """
+            ).format(jobs=self._t["jobs"]),
+            {"max_active_secs": max_active_secs},
+        )
+        return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
 
-        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                SQL(
-                    """
-                    WITH stuck AS (
-                        SELECT id AS _id
-                        FROM {jobs}
-                        WHERE status = 'aborting'
-                          AND ("""
-                    + self._STUCK_PREDICATE
-                    + """)
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE {jobs}
-                    SET status       = 'aborted',
-                        error        = 'aborted',
-                        result       = NULL,
-                        worker_id    = NULL,
-                        touched_at   = NULL,
-                        completed_at = NOW(),
-                        expires_at   = NOW() + failure_ttl * INTERVAL '1 second'
-                    FROM stuck
-                    WHERE {jobs}.id = stuck._id
-                    RETURNING
-                    """
-                    + JOB_COLS
-                ).format(jobs=self._t["jobs"]),
-                params,
-            )
-            aborted = [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
+    async def requeue_stuck(self, cur: Any, jobs: list[Job]) -> None:
+        """Put stuck jobs (locked by :meth:`lock_stuck`) back in ``queued`` right away.
 
-            for job in aborted:
-                swept_ids.append(job.id)
-                await cur.execute(
-                    SQL("""
-                        UPDATE {executions}
-                        SET status = 'aborted', error = 'aborted', completed_at = NOW()
-                        WHERE job_id = %(jid)s::uuid AND status = 'running'
-                    """).format(executions=self._t["executions"]),
-                    {"jid": job.id},
-                )
-                await cur.execute(
-                    SQL("DELETE FROM {worker_jobs} WHERE job_id = %(jid)s::uuid").format(
-                        worker_jobs=self._t["worker_jobs"]
-                    ),
-                    {"jid": job.id},
-                )
-                notify_queues.update(await self.settle_dependents(cur, job.id))
-                if job.failure_mode == "delete":
-                    # After settle_dependents: the dep rows cascade away with the job.
-                    await cur.execute(
-                        SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                        {"id": job.id},
-                    )
-
-            await cur.execute(
-                SQL(
-                    """
-                    WITH stuck AS (
-                        SELECT id, queue, attempts, max_attempts
-                        FROM {jobs}
-                        WHERE status = 'active'
-                          AND ("""
-                    + self._STUCK_PREDICATE
-                    + """)
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE {jobs} j
-                    SET status       = CASE WHEN s.attempts >= s.max_attempts THEN 'failed' ELSE 'queued' END,
-                        error        = CASE WHEN s.attempts >= s.max_attempts THEN 'swept'  ELSE error    END,
-                        worker_id    = NULL,
-                        started_at   = CASE WHEN s.attempts < s.max_attempts THEN NULL ELSE started_at END,
-                        touched_at   = NULL,
-                        scheduled_at = CASE WHEN s.attempts < s.max_attempts THEN NOW() ELSE scheduled_at END,
-                        completed_at = CASE WHEN s.attempts >= s.max_attempts THEN NOW() ELSE NULL END
-                    FROM stuck s
-                    WHERE j.id = s.id
-                    RETURNING j.id::text, j.queue, j.status
-                    """
-                ).format(jobs=self._t["jobs"]),
-                params,
-            )
-            rows = await cur.fetchall()
-
-            for row in rows:
-                job_id = row["id"]
-                swept_ids.append(job_id)
-
-                if row["status"] == "failed":
-                    await cur.execute(
-                        SQL("""
-                            UPDATE {executions}
-                            SET status = 'failed', error = 'swept', completed_at = NOW()
-                            WHERE job_id = %(jid)s::uuid AND status = 'running'
-                        """).format(executions=self._t["executions"]),
-                        {"jid": job_id},
-                    )
-                    notify_queues.update(await self.settle_dependents(cur, job_id))
-                else:
-                    notify_queues.add(row["queue"])
-
-                await cur.execute(
-                    SQL("DELETE FROM {worker_jobs} WHERE job_id = %(jid)s::uuid").format(
-                        worker_jobs=self._t["worker_jobs"]
-                    ),
-                    {"jid": job_id},
-                )
-
-            for queue in notify_queues:
-                await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{queue}")))
-
-        return SweepResult(job_ids=swept_ids, aborted=aborted)
+        The next dequeue counts a new attempt. Their execution rows are left as they
+        are, as before.
+        """
+        if not jobs:
+            return
+        ids = [j.id for j in jobs]
+        await cur.execute(
+            SQL("""
+                UPDATE {jobs}
+                SET status       = 'queued',
+                    worker_id    = NULL,
+                    started_at   = NULL,
+                    touched_at   = NULL,
+                    scheduled_at = NOW(),
+                    completed_at = NULL
+                WHERE id = ANY(%(ids)s::uuid[])
+            """).format(jobs=self._t["jobs"]),
+            {"ids": ids},
+        )
+        await cur.execute(
+            SQL("DELETE FROM {worker_jobs} WHERE job_id = ANY(%(ids)s::uuid[])").format(
+                worker_jobs=self._t["worker_jobs"]
+            ),
+            {"ids": ids},
+        )
+        for queue in {j.queue for j in jobs}:
+            await self.notify(cur, queue)
 
     # ------------------------------------------------------------------
     # Settlement helpers (cursor-level; composed by pgwerk.settlement)
