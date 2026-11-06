@@ -8,6 +8,8 @@ on:
       - ".github/workflows/ci.yml"
       - "pgwerk/**"
       - "tests/**"
+      - "conformance/**"
+      - "docs/reference/remote-openapi.json"
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
@@ -19,6 +21,8 @@ on:
       - ".github/workflows/ci.yml"
       - "pgwerk/**"
       - "tests/**"
+      - "conformance/**"
+      - "docs/reference/remote-openapi.json"
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
@@ -119,3 +123,58 @@ jobs:
         env:
           PGWERK_TEST_DSN: postgresql://pgwerk:pgwerk@localhost/pgwerk_test
         run: uv run pytest tests/integration/ -v --tb=short
+
+  conformance:
+    needs: [typecheck, build]
+    name: Remote protocol conformance
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pgwerk
+          POSTGRES_PASSWORD: pgwerk
+          POSTGRES_DB: pgwerk_conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DSN: postgresql://pgwerk:pgwerk@localhost/pgwerk_conformance
+      PGWERK_CONFORMANCE_URL: http://127.0.0.1:8000
+      PGWERK_CONFORMANCE_ADMIN_TOKEN: ci-admin-token
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Start a remote-workers server
+        run: |
+          uv run werk migrate --dsn "$DSN"
+          uv run werk api --dsn "$DSN" --remote-workers --api-token "$PGWERK_CONFORMANCE_ADMIN_TOKEN" \
+            --no-ui --port 8000 > server.log 2>&1 &
+          for i in $(seq 1 100); do
+            curl -s -o /dev/null -X POST http://127.0.0.1:8000/remote/v1/claim && break
+            sleep 0.2
+          done
+          token=$(uv run werk token create --dsn "$DSN" --name ci --queues conformance | grep '^pgwk_e_')
+          echo "::add-mask::$token"
+          echo "PGWERK_CONFORMANCE_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Server conformance
+        run: uv run pytest conformance/server -v --tb=short
+
+      - name: Server log
+        if: failure()
+        run: cat server.log
