@@ -122,6 +122,7 @@ class TestJobLifecycle:
         body = resp.json()
         assert body["job"]["id"] == job.id and body["job"]["kwargs"] == {"k": 1} and body["job"]["args"] == ["x"]
         assert body["lease_ttl"] == 60 and body["heartbeat_every"] == 15
+        assert (body["job"]["attempts"], body["job"]["lost_count"]) == (1, 0)
         lease = body["lease_id"]
 
         hb = await client.post(

@@ -28,6 +28,8 @@ class RemoteJob:
     lease_id: str
     lease_ttl: int
     heartbeat_every: int
+    lost_count: int = 0
+    """Times a worker was lost running this job before (it came back without using a retry)."""
 
     @classmethod
     def from_claim(cls, body: dict[str, Any]) -> "RemoteJob":
@@ -45,6 +47,7 @@ class RemoteJob:
             lease_id=body["lease_id"],
             lease_ttl=body["lease_ttl"],
             heartbeat_every=body["heartbeat_every"],
+            lost_count=job.get("lost_count", 0),
         )
 
 

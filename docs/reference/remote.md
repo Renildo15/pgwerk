@@ -121,7 +121,7 @@ JSON over HTTPS under `/remote/v1`. Every request sends `Pgwerk-Protocol: 1` and
   - Send a fresh `claim_id` (UUID) per claim and reuse it when retrying that claim: a lost response
     returns the same lease. Once that attempt is over, the id gets `204`.
   - `job` has `id`, `function`, `queue`, `kwargs`, `args`, `attempts`, `max_attempts`,
-    `timeout_secs` and `meta`. `kwargs` is the cross-language contract. A non-Python client should
+    `lost_count`, `timeout_secs` and `meta`. `kwargs` is the cross-language contract. A non-Python client should
     fail a job with non-empty `args` with `retryable: false`.
 - **`heartbeat`:** send it every `heartbeat_every` seconds. `abort: true` means stop the job and report
   `fail` with `aborted: true`.

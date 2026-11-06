@@ -139,6 +139,7 @@ def _job_body(job: "Job") -> dict[str, Any]:
         "args": payload.get("args") or [],
         "attempts": job.attempts,
         "max_attempts": job.max_attempts,
+        "lost_count": job.lost_count,
         "timeout_secs": job.timeout_secs,
         "meta": job.meta,
     }
