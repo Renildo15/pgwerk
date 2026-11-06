@@ -44,7 +44,9 @@ def _unique_prefix(suffix: str) -> str:
 
 class TestProdPaths:
     async def test_stale_job_handoff_keeps_new_owner_result(self, app, caplog):
-        job = await app.enqueue(slow_pure, seconds=1.0, _heartbeat=30)
+        # Worker A looks dead (stale heartbeat), the sweep hands the job to the queue,
+        # worker B claims it with a new lease, and A's late ack must not settle it.
+        job = await app.enqueue(slow_pure, seconds=1.0, _heartbeat=30, _retry=2)
 
         worker_a = AsyncWorker(
             app=app,
@@ -75,12 +77,12 @@ class TestProdPaths:
                     SQL("""
                         UPDATE {jobs}
                         SET started_at = NOW() - INTERVAL '2 hours',
-                            touched_at = NOW() - INTERVAL '2 hours',
-                            worker_id = gen_random_uuid()
+                            touched_at = NOW() - INTERVAL '2 hours'
                         WHERE id = %(id)s
                     """).format(jobs=app._t["jobs"]),
                     {"id": job.id},
                 )
+            assert job.id in await app.sweep()
 
             with caplog.at_level(logging.WARNING, logger="pgwerk.worker.base"):
                 await worker_b._setup_executor()

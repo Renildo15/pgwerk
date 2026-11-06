@@ -439,6 +439,7 @@ class BaseWorker(abc.ABC):
                 ordered_queues=ordered,
                 limit=limit,
                 strategy=self.dequeue_strategy,
+                lease_ttl=self.app.config.local_lease_ttl,
             )
         except Exception as exc:
             logger.error("Worker %s: dequeue error: %s", self.name, exc)
@@ -579,7 +580,7 @@ class BaseWorker(abc.ABC):
                 delay = min(delay * 2, 30.0)
 
     def _fence(self, job: Job) -> Fence:
-        return Fence(job_id=job.id, worker_id=self.id, attempt=job.attempts)
+        return Fence(job_id=job.id, worker_id=self.id, attempt=job.attempts, lease_id=job.lease_id)
 
     async def _ack(self, job: Job, result: Any = None) -> None:
         outcome = Outcome("complete", result_json=encode(self.app.serializer, result))

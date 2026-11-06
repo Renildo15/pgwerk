@@ -122,3 +122,12 @@ class TestAbort:
 def test_unknown_outcome_kind_raises():
     with pytest.raises(ValueError):
         plan(_job(), Outcome("lost"), NOW)  # type: ignore[arg-type]
+
+
+def test_worker_fence_requires_a_lease():
+    from pgwerk.settlement import Fence
+
+    with pytest.raises(ValueError):
+        Fence("j", "worker", 1)
+    Fence("j", "worker", 1, "lease")
+    Fence("j", None, 1)  # the sweeper, on rows it already locked

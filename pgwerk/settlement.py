@@ -57,14 +57,20 @@ class Outcome:
 class Fence:
     """Which row a settle may touch.
 
-    A worker settles only a row it still owns: ``worker_id`` matches and the job is
-    ``active`` or ``aborting``. The sweeper passes ``worker_id=None`` for rows it
-    has already locked; the status check still applies.
+    A worker settles only the attempt it still owns: ``worker_id`` and ``lease_id``
+    (the attempt's execution id) match, and the job is ``active`` or ``aborting``.
+    The sweeper passes neither for rows it has already locked; the status check
+    still applies.
     """
 
     job_id: str
     worker_id: str | None
     attempt: int
+    lease_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.worker_id is not None and self.lease_id is None:
+            raise ValueError("a worker's fence needs the attempt's lease_id")
 
 
 @dataclass(frozen=True)
@@ -200,7 +206,7 @@ class Settlement:
         dependents (on a terminal status), ``failure_mode=delete``, the next repeat,
         and ``NOTIFY`` for the queues that gained runnable work.
         """
-        current = await self._jobs.lock_for_settle(cur, fence.job_id, fence.worker_id)
+        current = await self._jobs.lock_for_settle(cur, fence.job_id, fence.worker_id, fence.lease_id)
         if current is None:
             return Settled(status=None)
 
@@ -220,9 +226,8 @@ class Settlement:
         await self._jobs.close_execution(
             cur,
             job.id,
-            fence.worker_id,
             # A worker closes its own attempt; the sweeper closes whatever is still running.
-            fence.attempt if fence.worker_id is not None else None,
+            fence.lease_id,
             status=_EXECUTION_STATUS[t.status],
             result_json=t.result_json if t.status == JobStatus.Complete else None,
             error=t.error if t.status != JobStatus.Complete else None,

@@ -86,7 +86,7 @@ class TestFailureModeDeleteFencing:
         from pgwerk.settlement import Fence
         from pgwerk.settlement import Outcome
 
-        settled = await app._settlement.settle(claimed, Fence(job.id, wid, claimed.attempts), Outcome("fail", "boom"))
+        settled = await app._settlement.settle(claimed, Fence(job.id, wid, claimed.attempts, claimed.lease_id), Outcome("fail", "boom"))
         assert settled.status is None
         assert (await app.get_job(job.id)).status == JobStatus.Active
 

@@ -148,26 +148,46 @@ class JobRepository:
         attempt: int,
         worker_id: str | None = None,
         conn: AsyncConnection | None = None,
-    ) -> None:
-        """Write the initial ``running`` execution row for an attempt.
+        lease_ttl: int = 300,
+    ) -> str:
+        """Write the initial ``running`` execution row for an attempt and lease it.
 
-        Mirrors the row the worker creates at dequeue time, for jobs claimed
-        outside the dequeue path (the ``_sync=True`` inline-execution path).
+        Mirrors what dequeue does, for jobs claimed outside the dequeue path (the
+        ``_sync=True`` inline-execution path): the execution id becomes the job's
+        ``lease_id``, so settling the attempt passes the lease fence.
 
         Args:
             job_id: ID of the job being executed.
             attempt: 1-based attempt number this execution row represents.
             worker_id: Worker that owns the attempt, or ``None`` to leave it unset.
             conn: Existing connection to write within; opens its own when ``None``.
+            lease_ttl: Lease TTL in seconds, when the job has no ``heartbeat_secs``.
+
+        Returns:
+            The lease id.
         """
-        async with self._conn(conn) as c:
-            await c.execute(
+        async with self._conn(conn, transaction=conn is None) as c, c.cursor() as cur:
+            await cur.execute(
                 SQL("""
                     INSERT INTO {executions} (job_id, worker_id, attempt, status)
                     VALUES (%(jid)s, %(wid)s, %(attempt)s, 'running')
+                    RETURNING id::text
                 """).format(executions=self._t["executions"]),
                 {"jid": job_id, "wid": worker_id, "attempt": attempt},
             )
+            row = await cur.fetchone()
+            assert row is not None
+            lease_id: str = row[0]
+            await cur.execute(
+                SQL("""
+                    UPDATE {jobs}
+                    SET lease_id = %(lease)s,
+                        lease_expires_at = NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second'
+                    WHERE id = %(jid)s
+                """).format(jobs=self._t["jobs"]),
+                {"lease": lease_id, "ttl": lease_ttl, "jid": job_id},
+            )
+        return lease_id
 
     async def insert_many(self, jobs: list[JobInsert], conn: AsyncConnection | None = None) -> list[Job | None]:
         results: list[Job | None] = []
@@ -344,7 +364,9 @@ class JobRepository:
                         expires_at = NULL,
                         scheduled_at = NOW(),
                         max_attempts = max_attempts + attempts,
-                        worker_id = NULL
+                        worker_id = NULL,
+                        lease_id = NULL,
+                        lease_expires_at = NULL
                     WHERE id = %(id)s
                       AND status IN ('failed', 'aborted')
                     RETURNING id, queue
@@ -431,12 +453,14 @@ class JobRepository:
         await cur.execute(
             SQL("""
                 UPDATE {jobs}
-                SET status       = 'queued',
-                    worker_id    = NULL,
-                    started_at   = NULL,
-                    touched_at   = NULL,
-                    scheduled_at = NOW(),
-                    completed_at = NULL
+                SET status           = 'queued',
+                    worker_id        = NULL,
+                    lease_id         = NULL,
+                    lease_expires_at = NULL,
+                    started_at       = NULL,
+                    touched_at       = NULL,
+                    scheduled_at     = NOW(),
+                    completed_at     = NULL
                 WHERE id = ANY(%(ids)s::uuid[])
             """).format(jobs=self._t["jobs"]),
             {"ids": ids},
@@ -454,11 +478,15 @@ class JobRepository:
     # Settlement helpers (cursor-level; composed by pgwerk.settlement)
     # ------------------------------------------------------------------
 
-    async def lock_for_settle(self, cur: Any, job_id: str, worker_id: str | None) -> str | None:
+    async def lock_for_settle(
+        self, cur: Any, job_id: str, worker_id: str | None, lease_id: str | None
+    ) -> str | None:
         """Lock a job that is still ``active``/``aborting`` and return its status.
 
-        With *worker_id*, the row must still belong to that worker. Returns ``None``
-        when nothing matches: the attempt no longer owns the job.
+        With *worker_id* and *lease_id* (a worker settling its attempt), the row must
+        still hold that lease for that worker. The sweeper passes neither, for rows it
+        already locked. Returns ``None`` when nothing matches: the attempt no longer
+        owns the job.
         """
         await cur.execute(
             SQL("""
@@ -467,9 +495,10 @@ class JobRepository:
                 WHERE id = %(id)s
                   AND status IN ('active', 'aborting')
                   AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid)
+                  AND (%(lease)s::uuid IS NULL OR lease_id = %(lease)s::uuid)
                 FOR UPDATE
             """).format(jobs=self._t["jobs"]),
-            {"id": job_id, "wid": worker_id},
+            {"id": job_id, "wid": worker_id, "lease": lease_id},
         )
         row = await cur.fetchone()
         if row is None:
@@ -504,6 +533,8 @@ class JobRepository:
                     error        = CASE WHEN %(status)s = 'complete' THEN error ELSE %(error)s END,
                     expires_at   = %(expires_at)s,
                     worker_id    = NULL,
+                    lease_id         = NULL,
+                    lease_expires_at = NULL,
                     touched_at   = CASE WHEN %(status)s = 'complete' THEN touched_at ELSE NULL END,
                     started_at   = CASE WHEN %(status)s IN ('queued', 'scheduled') THEN NULL ELSE started_at END,
                     scheduled_at = COALESCE(%(scheduled_at)s::timestamptz, scheduled_at),
@@ -525,20 +556,16 @@ class JobRepository:
         self,
         cur: Any,
         job_id: str,
-        worker_id: str | None,
-        attempt: int | None,
+        lease_id: str | None,
         *,
         status: str,
         result_json: str | None,
         error: str | None,
     ) -> None:
-        """Close the job's ``running`` execution row for this attempt.
+        """Close the attempt's execution row (its id is the lease id).
 
-        With *worker_id*, only that worker's execution of *attempt* is closed, or one
-        with no worker id (``_sync=True`` executions, since the sync worker isn't a
-        registered worker). The steal path can create a second execution with the
-        same attempt number, so the attempt alone isn't enough. With
-        ``worker_id=None`` (the sweeper), every ``running`` execution is closed.
+        With ``lease_id=None`` (the sweeper, or rows claimed before leases existed),
+        every ``running`` execution of the job is closed.
         """
         await cur.execute(
             SQL("""
@@ -546,17 +573,9 @@ class JobRepository:
                 SET status = %(status)s, result = %(result)s, error = %(error)s, completed_at = NOW()
                 WHERE job_id = %(jid)s
                   AND status = 'running'
-                  AND (%(attempt)s::int IS NULL OR attempt = %(attempt)s::int)
-                  AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid OR worker_id IS NULL)
+                  AND (%(lease)s::uuid IS NULL OR id = %(lease)s::uuid)
             """).format(executions=self._t["executions"]),
-            {
-                "jid": job_id,
-                "wid": worker_id,
-                "attempt": attempt,
-                "status": status,
-                "result": result_json,
-                "error": error,
-            },
+            {"jid": job_id, "lease": lease_id, "status": status, "result": result_json, "error": error},
         )
 
     async def release_claim(self, cur: Any, job_id: str, worker_id: str | None) -> None:
@@ -822,7 +841,9 @@ class JobRepository:
                         expires_at = NULL,
                         scheduled_at = NOW(),
                         max_attempts = max_attempts + attempts,
-                        worker_id = NULL
+                        worker_id = NULL,
+                        lease_id = NULL,
+                        lease_expires_at = NULL
                     WHERE {where}
                     RETURNING queue
                 """).format(jobs=self._t["jobs"], where=where),
@@ -1103,17 +1124,24 @@ class WorkerRepository:
         ordered_queues: list[str],
         limit: int,
         strategy: DequeueStrategy,
+        lease_ttl: int = 300,
     ) -> list[Job]:
+        """Claim up to *limit* runnable jobs and give each attempt a lease.
+
+        Each claimed job gets ``attempts + 1``, a fresh ``lease_id`` (also the id of
+        the attempt's execution row) and ``lease_expires_at = NOW() + TTL``, where the
+        TTL is the job's ``heartbeat_secs`` or *lease_ttl*. Every later write for
+        this attempt is fenced on that ``lease_id``.
+
+        Only ``queued``/``scheduled`` jobs are claimed. A job whose worker died is
+        recovered by the sweep, not stolen here, so attempts are counted in one place.
+        """
         if strategy == DequeueStrategy.Priority:
-            order_sql = SQL(
-                "ORDER BY CASE WHEN status IN ('queued', 'scheduled') THEN 0 ELSE 1 END, "
-                "priority DESC, scheduled_at ASC"
-            )
+            order_sql = SQL("ORDER BY priority DESC, scheduled_at ASC")
             extra_params: dict[str, Any] = {}
         else:
             order_sql = SQL(
-                "ORDER BY CASE WHEN status IN ('queued', 'scheduled') THEN 0 ELSE 1 END, "
-                "array_position(%(ordered_queues)s::text[], queue), priority DESC, scheduled_at ASC"
+                "ORDER BY array_position(%(ordered_queues)s::text[], queue), priority DESC, scheduled_at ASC"
             )
             extra_params = {"ordered_queues": ordered_queues}
 
@@ -1122,31 +1150,19 @@ class WorkerRepository:
                 SQL(
                     """
                     WITH locked AS (
-                        SELECT id AS _id,
-                               status IN ('queued', 'scheduled') AS _is_new
+                        SELECT id AS _id, gen_random_uuid() AS _lease_id
                         FROM {jobs}
                         WHERE queue = ANY(%(queues)s)
+                          AND status IN ('queued', 'scheduled')
+                          AND scheduled_at <= NOW()
+                          AND (expires_at IS NULL OR expires_at > NOW())
                           AND (
-                              (
-                                  status IN ('queued', 'scheduled')
-                                  AND scheduled_at <= NOW()
-                                  AND (expires_at IS NULL OR expires_at > NOW())
-                                  AND (
-                                      group_key IS NULL
-                                      OR group_key NOT IN (
-                                          SELECT DISTINCT group_key FROM {jobs}
-                                          WHERE queue = ANY(%(queues)s)
-                                            AND status = 'active'
-                                            AND group_key IS NOT NULL
-                                      )
-                                  )
-                              )
-                              OR
-                              (
-                                  status = 'active'
-                                  AND worker_id IS DISTINCT FROM %(wid)s::uuid
-                                  AND heartbeat_secs IS NOT NULL
-                                  AND COALESCE(touched_at, started_at) + heartbeat_secs * INTERVAL '1 second' < NOW()
+                              group_key IS NULL
+                              OR group_key NOT IN (
+                                  SELECT DISTINCT group_key FROM {jobs}
+                                  WHERE queue = ANY(%(queues)s)
+                                    AND status = 'active'
+                                    AND group_key IS NOT NULL
                               )
                           )
                         {order_sql}
@@ -1154,17 +1170,19 @@ class WorkerRepository:
                         FOR UPDATE SKIP LOCKED
                     )
                     UPDATE {jobs}
-                    SET status     = 'active',
-                        started_at = NOW(),
-                        attempts   = attempts + CASE WHEN locked._is_new THEN 1 ELSE 0 END,
-                        worker_id  = %(wid)s
+                    SET status           = 'active',
+                        started_at       = NOW(),
+                        attempts         = attempts + 1,
+                        worker_id        = %(wid)s,
+                        lease_id         = locked._lease_id,
+                        lease_expires_at = NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second'
                     FROM locked
                     WHERE {jobs}.id = locked._id
                     RETURNING
                     """
                     + JOB_COLS
                 ).format(jobs=self._t["jobs"], order_sql=order_sql),
-                {"queues": ordered_queues, "limit": limit, "wid": worker_id, **extra_params},
+                {"queues": ordered_queues, "limit": limit, "wid": worker_id, "ttl": lease_ttl, **extra_params},
             )
             rows = await cur.fetchall()
             if not rows:
@@ -1186,10 +1204,10 @@ class WorkerRepository:
                 )
                 await cur.execute(
                     SQL("""
-                        INSERT INTO {executions} (job_id, worker_id, attempt, status)
-                        VALUES (%(jid)s, %(wid)s, %(attempt)s, 'running')
+                        INSERT INTO {executions} (id, job_id, worker_id, attempt, status)
+                        VALUES (%(lease)s, %(jid)s, %(wid)s, %(attempt)s, 'running')
                     """).format(executions=self._t["executions"]),
-                    {"jid": job.id, "wid": worker_id, "attempt": job.attempts},
+                    {"lease": job.lease_id, "jid": job.id, "wid": worker_id, "attempt": job.attempts},
                 )
 
             return jobs
@@ -1199,12 +1217,18 @@ class WorkerRepository:
     # ------------------------------------------------------------------
 
     async def requeue_cancelled(self, worker_id: str, job: Job) -> None:
+        """Put a job whose task was cancelled (e.g. on shutdown) back in the queue.
+
+        Fenced on the attempt's lease; the attempt doesn't count.
+        """
         async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:
             await cur.execute(
                 SQL("""
                     UPDATE {jobs}
                     SET status = 'queued',
                         worker_id = NULL,
+                        lease_id = NULL,
+                        lease_expires_at = NULL,
                         started_at = NULL,
                         touched_at = NULL,
                         scheduled_at = NOW(),
@@ -1212,17 +1236,18 @@ class WorkerRepository:
                         attempts = GREATEST(attempts - 1, 0)
                     WHERE id = %(id)s
                       AND worker_id = %(wid)s::uuid
+                      AND lease_id = %(lease)s::uuid
                       AND status IN ('active', 'aborting')
                 """).format(jobs=self._t["jobs"]),
-                {"id": job.id, "wid": worker_id},
+                {"id": job.id, "wid": worker_id, "lease": job.lease_id},
             )
             await cur.execute(
                 SQL("""
                     UPDATE {executions}
                     SET status = 'failed', error = 'cancelled', completed_at = NOW()
-                    WHERE job_id = %(jid)s AND attempt = %(attempt)s AND worker_id = %(wid)s::uuid
+                    WHERE id = %(lease)s::uuid AND status = 'running'
                 """).format(executions=self._t["executions"]),
-                {"jid": job.id, "attempt": job.attempts, "wid": worker_id},
+                {"lease": job.lease_id},
             )
             await cur.execute(
                 SQL("DELETE FROM {wj} WHERE worker_id = %(wid)s AND job_id = %(jid)s").format(

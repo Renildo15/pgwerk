@@ -24,7 +24,7 @@ async def _claim(app, **enqueue_kwargs):
     await app._worker_repo.register(wid, "test", ["default"], "{}")
     [claimed] = await app._worker_repo.dequeue(wid, ["default"], 1, DequeueStrategy.Priority)
     assert claimed.id == job.id
-    return claimed, Fence(claimed.id, wid, claimed.attempts)
+    return claimed, Fence(claimed.id, wid, claimed.attempts, claimed.lease_id)
 
 
 async def _count(app, function: str) -> int:
@@ -99,7 +99,7 @@ class TestAbortWins:
 class TestFence:
     async def test_other_workers_fence_writes_nothing(self, app):
         job, fence = await _claim(app)
-        stale = Fence(job.id, str(uuid.uuid4()), job.attempts)
+        stale = Fence(job.id, str(uuid.uuid4()), job.attempts, job.lease_id)
 
         assert (await app._settlement.settle(job, stale, Outcome("complete"))).status is None
         assert (await app.get_job(job.id)).status == JobStatus.Active

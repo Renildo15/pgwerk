@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 
 from typing import Any
@@ -526,7 +527,10 @@ class Werk:
         job = await self._job_repo.insert(data, conn=_conn, notify=False)
         if job is None:
             return None
-        await self._job_repo.record_execution(job.id, job.attempts, conn=_conn)
+        lease_id = await self._job_repo.record_execution(
+            job.id, job.attempts, conn=_conn, lease_ttl=self.config.local_lease_ttl
+        )
+        job = dataclasses.replace(job, lease_id=lease_id)
         await self._run_before_enqueue(job)
         await self._sync_worker._handle_job(job)  # type: ignore[union-attr]
         return await self._job_repo.get(job.id)
