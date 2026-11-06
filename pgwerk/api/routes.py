@@ -30,6 +30,7 @@ from .models import TableInfo
 from .models import QueueStats
 from .models import ServerInfo
 from .models import JobResponse
+from .models import FunctionResponse
 from .models import PurgeRequest
 from .models import ScheduleStats
 from .models import StatsResponse
@@ -320,6 +321,24 @@ class JobController(Controller):
 # ---------------------------------------------------------------------------
 # Workers
 # ---------------------------------------------------------------------------
+
+
+class FunctionController(Controller):
+    path = "/functions"
+
+    @get("")
+    async def list_functions(self, werk: Werk) -> list[FunctionResponse]:
+        """List the functions workers have declared they handle.
+
+        Informational only; enqueue never consults it.
+
+        Args:
+            werk: Werk application instance.
+
+        Returns:
+            Catalog entries sorted by name.
+        """
+        return [FunctionResponse(**r) for r in await werk.list_functions()]
 
 
 class WorkerController(Controller):
@@ -747,6 +766,7 @@ def make_router(guards: list[Guard] | None = None) -> Router:
         route_handlers=[
             JobController,
             WorkerController,
+            FunctionController,
             StatsController,
             SchedulesController,
             ServerController,

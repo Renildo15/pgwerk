@@ -69,3 +69,40 @@ def test_empty_function_list_is_rejected():
 
     with pytest.raises(ValueError):
         AsyncWorker(app=MagicMock(), functions=[])
+
+
+class TestCatalog:
+    async def test_registration_upserts_and_merges_languages(self, app):
+        await app._worker_repo.register(str(uuid.uuid4()), "py", ["default"], "{}", functions=["m.f", "m.g"])
+        await app._worker_repo.register(str(uuid.uuid4()), "go", ["default"], "{}", functions=["m.f"], lang="go")
+        await app._worker_repo.register(str(uuid.uuid4()), "py2", ["default"], "{}", functions=["m.f"])
+
+        catalog = {r["name"]: r["languages"] for r in await app.list_functions()}
+        assert catalog == {"m.f": ["go", "python"], "m.g": ["python"]}
+
+    async def test_worker_without_functions_adds_nothing(self, app):
+        await make_worker(app).run()
+        assert await app.list_functions() == []
+
+    async def test_running_worker_registers_its_functions(self, app):
+        await make_worker(app, functions=[noop]).run()
+        assert [r["name"] for r in await app.list_functions()] == ["tests.integration.tasks.noop"]
+
+    async def test_catalog_is_informational_unknown_functions_still_enqueue(self, app):
+        await app._worker_repo.register(str(uuid.uuid4()), "w", ["default"], "{}", functions=["m.only"])
+        job = await app.enqueue("some.unregistered.function")
+        assert job is not None and job.status == JobStatus.Queued
+
+    async def test_api_lists_the_catalog(self, app):
+        from litestar.testing import AsyncTestClient
+
+        from pgwerk.api.app import create_app
+        from pgwerk.config import WerkConfig
+
+        await app._worker_repo.register(str(uuid.uuid4()), "w", ["default"], "{}", functions=["m.f"])
+        api = create_app(WerkConfig(dsn=app.dsn, prefix=app.prefix))
+        async with AsyncTestClient(app=api) as client:
+            resp = await client.get("/api/functions")
+        assert resp.status_code == 200
+        [entry] = resp.json()
+        assert (entry["name"], entry["languages"]) == ("m.f", ["python"])

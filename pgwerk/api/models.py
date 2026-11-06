@@ -201,6 +201,21 @@ class ExecutionResponse:
 
 
 @dataclasses.dataclass
+class FunctionResponse:
+    """A function some worker declared it handles (informational catalog entry).
+
+    Attributes:
+        name: The function's name, as jobs are enqueued with it (a dotted path in Python).
+        languages: Languages of the workers that registered it.
+        last_registered_at: When a worker last registered it.
+    """
+
+    name: str
+    languages: list[str]
+    last_registered_at: datetime
+
+
+@dataclasses.dataclass
 class WorkerResponse:
     """Serialisable view of a registered worker row.
 

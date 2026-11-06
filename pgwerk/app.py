@@ -1117,6 +1117,18 @@ class Werk:
     # Workers
     # ------------------------------------------------------------------
 
+    async def list_functions(self) -> list[dict[str, Any]]:
+        """Return the function catalog: every function a worker has declared.
+
+        Informational only: it lists what workers registered with ``functions=``
+        (and in which languages), and nothing at enqueue reads it. Workers that
+        handle every function don't appear in it.
+
+        Returns:
+            Dicts with ``name``, ``languages`` and ``last_registered_at``.
+        """
+        return await self._worker_repo.list_functions()
+
     async def list_workers(self) -> list[dict[str, Any]]:
         """Return all registered worker rows.
 

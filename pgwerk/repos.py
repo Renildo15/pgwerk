@@ -1171,8 +1171,14 @@ class WorkerRepository:
         metadata: str,
         role: str = "worker",
         functions: list[str] | None = None,
+        lang: str = "python",
     ) -> None:
-        """Register (or re-register) a worker. ``functions=None`` means it handles all."""
+        """Register (or re-register) a worker. ``functions=None`` means it handles all.
+
+        Declared functions are also upserted into the function catalog with *lang*.
+        The catalog is informational only: nothing at enqueue reads it, so a worker's
+        registration can never change how jobs are enqueued.
+        """
         async with await self._connect() as conn, conn.transaction():
             await conn.execute(
                 SQL("""
@@ -1196,6 +1202,29 @@ class WorkerRepository:
                     "functions": functions,
                 },
             )
+            if functions:
+                await conn.execute(
+                    SQL("""
+                        INSERT INTO {functions} AS f (name, languages, last_registered_at)
+                        SELECT DISTINCT unnest(%(functions)s::text[]), ARRAY[%(lang)s]::text[], NOW()
+                        ON CONFLICT (name) DO UPDATE
+                            SET languages = ARRAY(
+                                    SELECT DISTINCT l FROM unnest(f.languages || EXCLUDED.languages) AS l ORDER BY l
+                                ),
+                                last_registered_at = NOW()
+                    """).format(functions=self._t["functions"]),
+                    {"functions": functions, "lang": lang},
+                )
+
+    async def list_functions(self) -> list[dict[str, Any]]:
+        """Return the function catalog, by name."""
+        async with await self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                SQL("SELECT name, languages, last_registered_at FROM {functions} ORDER BY name").format(
+                    functions=self._t["functions"]
+                )
+            )
+            return await cur.fetchall()
 
     async def deregister(self, worker_id: str) -> None:
         async with await self._connect() as conn, conn.transaction():

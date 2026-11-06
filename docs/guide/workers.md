@@ -163,6 +163,10 @@ the same codebase, without failing imports on jobs the worker can't run. Functio
 exactly against the `function` stored at enqueue (the callable's dotted path). Group
 concurrency (`_group`) still counts every function in the group.
 
+Declared functions are recorded in a catalog (`Werk.list_functions()`, `GET /api/functions`)
+with the languages of the workers that registered them. The catalog is informational:
+enqueueing never checks it, so you can enqueue a function no worker has registered yet.
+
 ## Maintenance
 
 Every `sweep_interval` seconds a maintenance pass:
