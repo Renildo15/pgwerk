@@ -18,6 +18,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The sweep no longer undoes aborts. A stuck `aborting` job now ends `aborted` (running `on_stopped`, settling dependents, honoring `failure_mode="delete"` and `failure_ttl`) instead of being requeued and run again. At the attempt cap it previously ended `failed`; it now ends `aborted`.
 - `failure_mode="delete"` is fenced: a late failure from an attempt that no longer owns the job no longer deletes it.
 - `failure_mode="delete"` settles dependents before deleting. Previously the dependency rows were deleted with the job and its dependents stayed in `waiting`.
+- Deleting a job (`Werk.delete_job`, `DELETE /api/jobs/{id}`) or purging it (`Werk.purge_jobs`, `POST /api/purge`, `werk purge`) settles the jobs waiting on it first. If it hadn't finished, it counts as aborted: dependents fail with `dependency failed`, or are queued when the dependency has `allow_failure=True`. Previously its dependency rows were deleted with it and its dependents stayed in `waiting` (and, with the new waiting-job recovery, would have run as if it had succeeded).
+- `werk purge` now goes through `Werk.purge_jobs`, which gained optional `queue` and `older_than_days=None` arguments. The `--older-than` option the docs described now exists.
 - Enqueueing a job with dependencies writes the job and its dependency rows in one transaction, so a crash in between can no longer leave a `waiting` job with no dependencies.
 - API bearer-token and dashboard Basic Auth checks compare in constant time.
 

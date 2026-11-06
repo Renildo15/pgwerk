@@ -896,6 +896,11 @@ class Werk:
     async def delete_job(self, job_id: str) -> None:
         """Permanently delete a single job row by ID.
 
+        Jobs waiting on it are settled first, as if it had been aborted: they fail
+        with ``error = 'dependency failed'`` unless their dependency on it has
+        ``allow_failure=True``, in which case they are queued. If the job had already
+        finished, they settle by its real status. No callbacks run.
+
         Args:
             job_id: UUID of the job to delete.
         """
@@ -970,17 +975,24 @@ class Werk:
         """
         return await self._job_repo.bulk_cancel(queue=queue)
 
-    async def purge_jobs(self, statuses: list[str], older_than_days: int) -> int:
-        """Permanently delete terminal jobs matching the given criteria.
+    async def purge_jobs(
+        self, statuses: list[str], older_than_days: int | None = None, queue: str | None = None
+    ) -> int:
+        """Permanently delete jobs matching the given criteria.
+
+        Jobs waiting on a purged job are settled first, the same way
+        :meth:`delete_job` settles them.
 
         Args:
             statuses: Job status values to delete (e.g. ``["failed", "complete"]``).
-            older_than_days: Only delete jobs completed more than this many days ago.
+            older_than_days: Only delete jobs enqueued more than this many days ago;
+                ``None`` for no age limit.
+            queue: Only delete jobs in this queue; ``None`` for every queue.
 
         Returns:
             Number of job rows deleted.
         """
-        return await self._job_repo.purge(statuses=statuses, older_than_days=older_than_days)
+        return await self._job_repo.purge(statuses=statuses, older_than_days=older_than_days, queue=queue)
 
     # ------------------------------------------------------------------
     # Schedules

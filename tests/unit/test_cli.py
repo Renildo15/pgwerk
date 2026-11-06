@@ -159,3 +159,26 @@ class TestApiCommand:
         assert cfg.poll_interval == 1.5
         assert cfg.schema == "custom"
         assert cfg.dsn == "postgresql://x/y"
+
+
+class TestPurgeCommand:
+    def test_purge_passes_filters_to_purge_jobs(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        from unittest.mock import MagicMock
+
+        fake = MagicMock()
+        fake.__aenter__ = AsyncMock(return_value=fake)
+        fake.__aexit__ = AsyncMock(return_value=None)
+        fake.purge_jobs = AsyncMock(return_value=3)
+        import sys
+
+        # ``pgwerk.cli.purge`` resolves to the Click command, not the module.
+        monkeypatch.setattr(sys.modules["pgwerk.cli.purge"], "load_app", lambda _: fake)
+
+        result = CliRunner().invoke(
+            cli, ["purge", "x:app", "--status", "failed,queued", "--queue", "q", "--older-than", "7", "--yes"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Purged 3 job(s)." in result.output
+        fake.purge_jobs.assert_awaited_once_with(statuses=["failed", "queued"], older_than_days=7, queue="q")

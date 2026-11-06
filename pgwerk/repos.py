@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 import psycopg
 
 from psycopg.sql import SQL
+from psycopg.sql import Composable
 from psycopg.sql import Identifier
 from psycopg.sql import Placeholder
 from psycopg.rows import dict_row
@@ -591,11 +592,71 @@ class JobRepository:
         return bool(row["all_settled"] if isinstance(row, dict) else row[0])
 
     async def delete(self, job_id: str) -> None:
-        async with await self._connect() as conn:
-            await conn.execute(
-                SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                {"id": job_id},
+        """Delete one job, settling its dependents as if it had been aborted."""
+        await self._delete_settling_dependents(SQL("id = %(id)s"), {"id": job_id})
+
+    async def _delete_settling_dependents(self, where: Composable, params: dict[str, Any]) -> int:
+        """Delete the jobs matching *where*, settling their ``waiting`` dependents first.
+
+        A dependent's dep rows cascade away with the job, so deleting without settling
+        would leave it looking as if the dependency had succeeded (and maintenance would
+        queue it). Instead a job that hasn't finished is treated as aborted: dependents
+        fail with ``dependency failed`` unless the dependency has ``allow_failure``. A
+        finished job settles them by its real status. Callbacks don't run.
+
+        *where* is evaluated against ``{jobs}`` with no alias, in one transaction.
+
+        Returns:
+            Number of job rows deleted.
+        """
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            # Only jobs with waiting dependents need settling; for a large purge that's
+            # a small subset, so don't settle row by row.
+            await cur.execute(
+                SQL("""
+                    SELECT p.id::text, p.status
+                    FROM {jobs} p
+                    WHERE p.id IN (
+                        SELECT d.depends_on
+                        FROM {deps} d
+                        JOIN {jobs} dep ON dep.id = d.job_id
+                        WHERE dep.status = 'waiting'
+                    )
+                      AND p.id IN (SELECT id FROM {jobs} WHERE {where})
+                    FOR UPDATE OF p
+                """).format(jobs=self._t["jobs"], deps=self._t["deps"], where=where),
+                params,
             )
+            parents = await cur.fetchall()
+            parent_ids = [r["id"] for r in parents]
+            unfinished = [r["id"] for r in parents if r["status"] not in ("complete", "failed", "aborted")]
+
+            notify_queues: set[str] = set()
+            if unfinished:
+                await cur.execute(
+                    SQL("""
+                        UPDATE {jobs}
+                        SET status = 'aborted', error = 'deleted', completed_at = NOW(), worker_id = NULL
+                        WHERE id = ANY(%(ids)s::uuid[])
+                    """).format(jobs=self._t["jobs"]),
+                    {"ids": unfinished},
+                )
+            for jid in parent_ids:
+                notify_queues.update(await self.settle_dependents(cur, jid))
+
+            # Parents just marked 'aborted' may no longer match a status filter.
+            await cur.execute(
+                SQL("DELETE FROM {jobs} WHERE ({where}) OR id = ANY(%(_parent_ids)s::uuid[])").format(
+                    jobs=self._t["jobs"], where=where
+                ),
+                {**params, "_parent_ids": parent_ids},
+            )
+            deleted = cur.rowcount
+
+            for queue in notify_queues:
+                await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{queue}")))
+
+        return deleted
 
     async def update_job(
         self,
@@ -716,17 +777,20 @@ class JobRepository:
             )
             return cur.rowcount
 
-    async def purge(self, statuses: list[str], older_than_days: int) -> int:
-        async with await self._connect() as conn, conn.cursor() as cur:
-            await cur.execute(
-                SQL("""
-                    DELETE FROM {jobs}
-                    WHERE status = ANY(%(statuses)s)
-                      AND enqueued_at < NOW() - make_interval(days => %(days)s)
-                """).format(jobs=self._t["jobs"]),
-                {"statuses": statuses, "days": older_than_days},
-            )
-            return cur.rowcount
+    async def purge(self, statuses: list[str], older_than_days: int | None = None, queue: str | None = None) -> int:
+        """Delete jobs by status, settling their ``waiting`` dependents first.
+
+        See :meth:`_delete_settling_dependents` for what happens to dependents.
+        """
+        where: Composable = SQL("status = ANY(%(statuses)s)")
+        params: dict[str, Any] = {"statuses": statuses}
+        if older_than_days is not None:
+            where = SQL("{} AND enqueued_at < NOW() - make_interval(days => %(days)s)").format(where)
+            params["days"] = older_than_days
+        if queue is not None:
+            where = SQL("{} AND queue = %(queue)s").format(where)
+            params["queue"] = queue
+        return await self._delete_settling_dependents(where, params)
 
     async def list_schedule_stats(self) -> list[dict[str, Any]]:
         async with await self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:

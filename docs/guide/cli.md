@@ -117,7 +117,11 @@ werk purge APP [OPTIONS]
 | Option | Description |
 |---|---|
 | `--status` | Comma-separated statuses to purge (e.g. `complete,failed`) |
-| `--older-than` | Only delete jobs older than this many days |
+| `--queue` | Only delete jobs in this queue |
+| `--older-than` | Only delete jobs enqueued more than this many days ago |
+
+Jobs waiting on a purged job are settled first: they fail with `dependency failed`, or are
+queued when the dependency has `allow_failure=True`.
 
 ```bash
 # Delete all completed jobs
