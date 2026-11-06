@@ -13,6 +13,7 @@ def _app(**overrides):
     app = MagicMock()
     app.config.sweep_interval = 60.0
     app.sweep = AsyncMock(return_value=["a", "b"])
+    app.expire_unstarted = AsyncMock(return_value=4)
     app.reconcile_waiting = AsyncMock(return_value=ReconcileResult(queued=2, failed=1))
     app.reschedule_stuck = AsyncMock(return_value=3)
     for name, value in overrides.items():
@@ -26,6 +27,7 @@ class TestRunOnce:
         assert report.swept == ["a", "b"]
         assert report.reconciled == ReconcileResult(queued=2, failed=1)
         assert report.rescheduled == 3
+        assert report.expired == 4
         assert report.errors == {}
 
     async def test_failing_task_does_not_stop_the_others(self):
@@ -33,6 +35,7 @@ class TestRunOnce:
         report = await Maintenance(app).run_once()
         assert report.errors == {"sweep": "db down"}
         assert report.swept == []
+        app.expire_unstarted.assert_awaited_once()
         app.reconcile_waiting.assert_awaited_once()
         app.reschedule_stuck.assert_awaited_once()
 

@@ -393,6 +393,32 @@ class JobRepository:
         )
         return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
 
+    async def lock_expired_unstarted(self, cur: Any, limit: int) -> list[Job]:
+        """Lock ``queued``/``scheduled`` jobs past their ``expires_at`` (the ``_ttl``).
+
+        On a job that hasn't started, ``expires_at`` is the ``_ttl`` deadline; on a
+        finished one it is the retention time, which is why only unstarted statuses
+        are matched.
+        """
+        await cur.execute(
+            SQL(
+                """
+                SELECT """
+                + JOB_COLS
+                + """
+                FROM {jobs}
+                WHERE status IN ('queued', 'scheduled')
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= NOW()
+                ORDER BY expires_at
+                LIMIT %(limit)s
+                FOR UPDATE SKIP LOCKED
+                """
+            ).format(jobs=self._t["jobs"]),
+            {"limit": limit},
+        )
+        return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
+
     async def requeue_stuck(self, cur: Any, jobs: list[Job]) -> None:
         """Put stuck jobs (locked by :meth:`lock_stuck`) back in ``queued`` right away.
 

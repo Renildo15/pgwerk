@@ -304,6 +304,7 @@ class TestSweepLoop:
         w.app.sweep = AsyncMock(return_value=[])
         w.app.reconcile_waiting = AsyncMock(return_value=ReconcileResult(queued=0, failed=0))
         w.app.reschedule_stuck = AsyncMock(return_value=0)
+        w.app.expire_unstarted = AsyncMock(return_value=0)
 
         async def fast_sleep(delay):
             w._running = False
@@ -314,6 +315,7 @@ class TestSweepLoop:
         w.app.sweep.assert_awaited_once()
         w.app.reconcile_waiting.assert_awaited_once()
         w.app.reschedule_stuck.assert_awaited_once()
+        w.app.expire_unstarted.assert_awaited_once()
 
 
 class TestMaintenanceOption:

@@ -45,7 +45,8 @@ class Outcome:
     result_json: str | None = None
     """Encoded return value, for ``complete``."""
     error: str | None = None
-    """Error text for ``fail`` (a traceback for local workers)."""
+    """Error text for ``fail`` (a traceback for local workers), or the reason for an
+    ``abort`` (default ``"aborted"``)."""
     retryable: bool = True
     """``False`` fails the job terminally, even with attempts left."""
 
@@ -134,7 +135,7 @@ def plan(job: Job, outcome: Outcome, now: datetime | None = None) -> Transition:
     if outcome.kind == "abort":
         return Transition(
             status=JobStatus.Aborted,
-            error="aborted",
+            error=outcome.error or "aborted",
             expires_at=_expiry(job.failure_ttl),
             delete=job.failure_mode == "delete",
             callback=job.on_stopped,
@@ -297,3 +298,42 @@ class Settlement:
         for job, result in settled:
             await self.run_callback(job, result)
         return [job.id for job in stuck]
+
+    async def expire_unstarted(self, limit: int = 500) -> int:
+        """Abort ``queued``/``scheduled`` jobs whose ``_ttl`` ran out before they started.
+
+        Each one settles as ``aborted`` with ``error = 'expired'``: dependents settle
+        (failing unless the dependency has ``allow_failure``), ``failure_mode="delete"``
+        deletes the row, ``failure_ttl`` sets the new ``expires_at``, and ``on_stopped``
+        runs after commit. Rows locked elsewhere are skipped.
+
+        Args:
+            limit: Maximum number of jobs to expire in one call.
+
+        Returns:
+            Number of jobs expired.
+        """
+        expired: list[tuple[Job, Transition]] = []
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            notify: set[str] = set()
+            for job in await self._jobs.lock_expired_unstarted(cur, limit):
+                t = plan(job, Outcome("abort", error="expired"))
+                await self._jobs.write_settled(
+                    cur,
+                    job.id,
+                    status=t.status.value,
+                    error=t.error,
+                    result_json=None,
+                    scheduled_at=None,
+                    expires_at=t.expires_at,
+                )
+                notify.update(await self._jobs.settle_dependents(cur, job.id))
+                if t.delete:
+                    await self._jobs.delete_settled(cur, job.id)
+                expired.append((job, t))
+            for queue in notify:
+                await self._jobs.notify(cur, queue)
+
+        for job, t in expired:
+            await self.run_callback(job, Settled(status=t.status, transition=t))
+        return len(expired)

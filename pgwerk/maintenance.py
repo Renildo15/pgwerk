@@ -40,6 +40,8 @@ class MaintenanceReport:
     """IDs of stuck jobs recovered by the sweep."""
     reconciled: ReconcileResult = field(default_factory=lambda: ReconcileResult(queued=0, failed=0))
     """Stranded ``waiting`` jobs that were settled."""
+    expired: int = 0
+    """Unstarted jobs aborted because their ``_ttl`` ran out."""
     rescheduled: int = 0
     """Due ``scheduled`` jobs moved to ``queued``."""
     errors: dict[str, str] = field(default_factory=dict)
@@ -47,7 +49,7 @@ class MaintenanceReport:
 
 
 class Maintenance:
-    """Runs sweep, waiting-job reconciliation and rescheduling on an interval.
+    """Runs sweep, ``_ttl`` expiry, waiting-job reconciliation and rescheduling on an interval.
 
     Args:
         app: Connected :class:`~pgwerk.app.Werk` instance.
@@ -68,6 +70,12 @@ class Maintenance:
         except Exception as exc:
             report.errors["sweep"] = str(exc)
             logger.warning("maintenance: sweep failed: %s", exc)
+
+        try:
+            report.expired = await self.app.expire_unstarted()
+        except Exception as exc:
+            report.errors["expire_unstarted"] = str(exc)
+            logger.warning("maintenance: expiring unstarted jobs failed: %s", exc)
 
         try:
             report.reconciled = await self.app.reconcile_waiting()

@@ -870,6 +870,25 @@ class Werk:
             logger.info("werk: sweep recovered %d stuck job(s): %s", len(swept), swept)
         return swept
 
+    async def expire_unstarted(self, limit: int = 500) -> int:
+        """Abort jobs whose ``_ttl`` ran out before they started.
+
+        A ``queued`` or ``scheduled`` job past its ``_ttl`` is never dequeued. This
+        settles it as ``aborted`` with ``error = 'expired'``, so its dependents settle,
+        ``failure_mode`` applies, ``on_stopped`` runs and :meth:`wait_for` returns.
+        Runs as part of maintenance; safe to run from several processes at once.
+
+        Args:
+            limit: Maximum number of jobs to expire in one call.
+
+        Returns:
+            Number of jobs expired.
+        """
+        expired = await self._settlement.expire_unstarted(limit=limit)
+        if expired:
+            logger.info("werk: expired %d job(s) whose _ttl ran out before they started", expired)
+        return expired
+
     async def reconcile_waiting(self, limit: int = 500) -> ReconcileResult:
         """Settle ``waiting`` jobs whose dependencies have all settled.
 

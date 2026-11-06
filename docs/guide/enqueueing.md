@@ -115,6 +115,17 @@ await app.enqueue(my_func, _result_ttl=3600)
 await app.enqueue(my_func, _failure_ttl=86400)
 ```
 
+A job whose `_ttl` runs out before a worker starts it is never run. The next
+[maintenance pass](workers.md#maintenance) settles it as `aborted` with `error = "expired"`:
+
+- its dependents fail with `dependency failed`, or run if the dependency has `allow_failure=True`;
+- `failure_mode="delete"` deletes it;
+- `on_stopped` runs (check `job.error == "expired"` to tell expiry from an abort);
+- `wait_for()` returns it.
+
+`_ttl` only covers the wait before the first attempt: a retry clears it. It is ignored on jobs
+with `_depends_on`.
+
 ### Failure mode
 
 By default, failed jobs are kept in the database (`failure_mode="hold"`) so you can inspect and retry them. Set `failure_mode="delete"` to remove the row on terminal failure:
