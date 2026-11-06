@@ -7,6 +7,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- API bearer-token and dashboard Basic Auth checks compare in constant time.
+
+---
+
 ## [0.1.26] - 2026-10-21
 
 ### Fixed
