@@ -50,6 +50,11 @@ queue `conformance` and implement four functions:
 # the Python RemoteWorker (default)
 uv run pytest conformance/client -v
 
+# the bundled TypeScript and Go clients
+PGWERK_CONFORMANCE_CLIENT="node clients/ts/conformance/worker.ts" uv run pytest conformance/client -v
+(cd clients/go && go build -o bin/conformance ./cmd/conformance)
+PGWERK_CONFORMANCE_CLIENT=clients/go/bin/conformance uv run pytest conformance/client -v
+
 # any other client: a command that starts it
-PGWERK_CONFORMANCE_CLIENT="./my-go-worker" uv run pytest conformance/client -v
+PGWERK_CONFORMANCE_CLIENT="./my-worker" uv run pytest conformance/client -v
 ```

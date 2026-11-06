@@ -9,6 +9,7 @@ on:
       - "pgwerk/**"
       - "tests/**"
       - "conformance/**"
+      - "clients/**"
       - "docs/reference/remote-openapi.json"
       - "pyproject.toml"
       - "uv.lock"
@@ -22,6 +23,7 @@ on:
       - "pgwerk/**"
       - "tests/**"
       - "conformance/**"
+      - "clients/**"
       - "docs/reference/remote-openapi.json"
       - "pyproject.toml"
       - "uv.lock"
@@ -176,6 +178,41 @@ jobs:
         run: uv run pytest conformance/server -v --tb=short
 
       - name: Client conformance (Python RemoteWorker)
+        run: uv run pytest conformance/client -v --tb=short
+
+      # --- TypeScript client (clients/ts) ---------------------------------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"  # runs the .ts sources directly (type stripping)
+
+      - name: TypeScript client - typecheck and unit tests
+        working-directory: clients/ts
+        run: |
+          npx -y -p typescript@5.9 tsc -p tsconfig.check.json
+          node --test "test/**/*.test.ts"
+
+      - name: Client conformance (TypeScript)
+        env:
+          PGWERK_CONFORMANCE_CLIENT: node clients/ts/conformance/worker.ts
+        run: uv run pytest conformance/client -v --tb=short
+
+      # --- Go client (clients/go) -------------------------------------------------
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: clients/go/go.mod
+
+      - name: Go client - vet, unit tests, build
+        working-directory: clients/go
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+          CGO_ENABLED=0 go build -o bin/conformance ./cmd/conformance
+
+      - name: Client conformance (Go)
+        env:
+          PGWERK_CONFORMANCE_CLIENT: clients/go/bin/conformance
         run: uv run pytest conformance/client -v --tb=short
 
       - name: Server log

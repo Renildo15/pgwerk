@@ -109,6 +109,34 @@ asyncio.run(worker.run())   # SIGTERM: finishes running jobs, then deregisters
   under the old session are lost and come back to the queue. A revoked or retired worker gets
   `401 unauthorized` and stops.
 
+## Other languages
+
+Remote workers can be written in any language that speaks [protocol v1](remote-protocol.md). The
+repository ships two thin clients. Both pass the client conformance suite and have their own
+semver:
+
+| Language | Package | Quickstart |
+|---|---|---|
+| Go | `github.com/pgwerk/pgwerk/clients/go` | [`clients/go/README.md`](https://github.com/pgwerk/pgwerk/tree/main/clients/go) |
+| TypeScript / Node ≥ 20.3 | `@pgwerk/remote-worker` | [`clients/ts/README.md`](https://github.com/pgwerk/pgwerk/tree/main/clients/ts) |
+
+```go
+pgwerk.Handle(w, "media.tasks.render", func(ctx pgwerk.Context, in RenderIn) (RenderOut, error) { … })
+```
+
+```ts
+worker.handle("media.tasks.render", async (ctx, { assetId }) => ({ uri: `s3://bucket/${assetId}.png` }));
+```
+
+Jobs for these workers are enqueued by name, from Python or the admin API:
+
+```python
+await app.enqueue("media.tasks.render", _queue="render", asset_id="a1", upload_url=url)
+```
+
+Pass arguments as keywords: `kwargs` is the cross-language contract, and non-Python clients fail
+jobs that carry positional `args` (`UnsupportedPayload`).
+
 ## Large files
 
 pgwerk doesn't store artifacts. Put presigned URLs (or what's needed to get them) in the job's
