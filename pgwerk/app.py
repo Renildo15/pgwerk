@@ -265,6 +265,7 @@ class Werk:
         _depends_on: list[Dependency | str | Job] | Dependency | str | Job | None = None,
         _schedule_name: str | None = None,
         _failure_mode: FailureMode | str = "hold",
+        _max_lost: int | None = None,
         _sync: bool = False,
         **kwargs: Any,
     ) -> Job | None:
@@ -300,6 +301,9 @@ class Werk:
             _schedule_name: Name of the Schedule this job was enqueued from.
             _failure_mode: What to do with the job row on terminal failure —
                 ``"hold"`` keeps it for inspection/retry, ``"delete"`` removes it.
+            _max_lost: How many times the job may be requeued because its worker
+                vanished before it fails with ``lease_lost`` (default
+                ``config.default_max_lost``). These requeues don't use up retries.
             **kwargs: Keyword arguments forwarded to *func*.
 
         Returns:
@@ -366,6 +370,7 @@ class Werk:
             repeat_intervals=encode(self.serializer, repeat_intervals),
             schedule_name=_schedule_name,
             dep_ids=dep_ids,
+            max_lost=_max_lost if _max_lost is not None else self.config.default_max_lost,
         )
 
         if _sync:
@@ -482,6 +487,7 @@ class Werk:
                     repeat_interval_secs=spec.repeat.interval if spec.repeat and not spec.repeat.intervals else None,
                     repeat_intervals=encode(self.serializer, spec.repeat.intervals if spec.repeat else None),
                     schedule_name=spec.schedule_name,
+                    max_lost=spec.max_lost if spec.max_lost is not None else self.config.default_max_lost,
                     dep_ids=dep_ids,
                 )
             )

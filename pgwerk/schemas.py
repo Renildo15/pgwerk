@@ -64,6 +64,11 @@ class Job:
         repeat_intervals: Per-run repeat delays in seconds.
         schedule_name: Name of the Schedule that created this job, if any.
         failure_mode: What to do on terminal failure — ``"hold"`` or ``"delete"``.
+        lease_id: ID of the current attempt's execution row, while the job is
+            ``active``/``aborting``. Every settle and renewal is fenced on it.
+        lease_expires_at: When the current claim lapses unless renewed.
+        lost_count: Times the job was requeued because its worker vanished.
+        max_lost: Cap on ``lost_count`` before the job fails with ``lease_lost``.
     """
 
     id: str
@@ -103,6 +108,10 @@ class Job:
     repeat_intervals: list[int] | None = None
     schedule_name: str | None = None
     failure_mode: str = "hold"
+    lease_id: str | None = None
+    lease_expires_at: datetime | None = None
+    lost_count: int = 0
+    max_lost: int | None = None
 
     def __post_init__(self) -> None:
         """Coerce a raw status string to a ``JobStatus`` enum value."""
@@ -124,6 +133,8 @@ class Job:
         d["id"] = str(d["id"])
         if d.get("worker_id") is not None:
             d["worker_id"] = str(d["worker_id"])
+        if d.get("lease_id") is not None:
+            d["lease_id"] = str(d["lease_id"])
         d["payload"] = decode(serializer, d.get("payload"))
         d["result"] = decode(serializer, d.get("result"))
         d["meta"] = decode(serializer, d.get("meta"))
@@ -168,6 +179,7 @@ class JobInsert:
     worker_id: str | None = None
     started_at: datetime | None = None
     attempts: int = 0
+    max_lost: int | None = None
 
     def as_params(self) -> dict[str, Any]:
         """Return a dict of all fields except ``dep_ids`` for use as DB query parameters.
@@ -450,6 +462,7 @@ class EnqueueParams:
     depends_on: "list[Dependency | str | Job] | Dependency | str | Job | None" = None
     schedule_name: str | None = None
     failure_mode: str = "hold"
+    max_lost: int | None = None
 
 
 JOB_COLS: LiteralString = cast(  # type: ignore[redundant-cast]

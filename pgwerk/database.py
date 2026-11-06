@@ -105,7 +105,11 @@ class DatabaseManager:
                     repeat_remaining     INT,
                     repeat_interval_secs INT,
                     repeat_intervals     JSONB,
-                    schedule_name        TEXT
+                    schedule_name        TEXT,
+                    lease_id             UUID,
+                    lease_expires_at     TIMESTAMPTZ,
+                    lost_count           INT         NOT NULL DEFAULT 0,
+                    max_lost             INT
                 )
             """).format(jobs=t("jobs")),
             # Full-status index — supports UI queries and filtering on any status
@@ -133,6 +137,15 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (queue, completed_at) "
                 "WHERE completed_at IS NOT NULL"
             ).format(idx=idx("jobs_completed_at_idx"), jobs=t("jobs")),
+            # Partial index — the sweep's expired-lease scan
+            SQL(
+                "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (lease_expires_at) "
+                "WHERE status IN ('active', 'aborting') AND lease_id IS NOT NULL"
+            ).format(idx=idx("jobs_lease_expiry_idx"), jobs=t("jobs")),
+            # Partial index — maintenance: unstarted jobs past _ttl, finished rows past retention
+            SQL("CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (expires_at) WHERE expires_at IS NOT NULL").format(
+                idx=idx("jobs_expires_at_idx"), jobs=t("jobs")
+            ),
             # --- worker_jobs --------------------------------------------------
             SQL(
                 "CREATE {unlogged}TABLE IF NOT EXISTS {worker_jobs} ("
@@ -321,6 +334,28 @@ class DatabaseManager:
                         "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (queue, completed_at) "
                         "WHERE completed_at IS NOT NULL"
                     ).format(idx=idx("jobs_completed_at_idx"), jobs=t("jobs")),
+                ],
+            ),
+            (
+                8,
+                [
+                    # Leases: each attempt is fenced by its execution id (lease_id).
+                    SQL("ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS lease_id UUID").format(jobs=t("jobs")),
+                    SQL("ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ").format(
+                        jobs=t("jobs")
+                    ),
+                    # Lost-vs-failed: losing a worker requeues without using a retry, up to max_lost.
+                    SQL("ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS lost_count INT NOT NULL DEFAULT 0").format(
+                        jobs=t("jobs")
+                    ),
+                    SQL("ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS max_lost INT").format(jobs=t("jobs")),
+                    SQL(
+                        "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (lease_expires_at) "
+                        "WHERE status IN ('active', 'aborting') AND lease_id IS NOT NULL"
+                    ).format(idx=idx("jobs_lease_expiry_idx"), jobs=t("jobs")),
+                    SQL(
+                        "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (expires_at) WHERE expires_at IS NOT NULL"
+                    ).format(idx=idx("jobs_expires_at_idx"), jobs=t("jobs")),
                 ],
             ),
         ]

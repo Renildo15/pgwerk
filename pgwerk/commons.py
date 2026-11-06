@@ -25,6 +25,7 @@ class ExecutionStatus(str, enum.Enum):
     Complete = "complete"
     Failed = "failed"
     Aborted = "aborted"
+    Lost = "lost"
 
 
 class DequeueStrategy(str, enum.Enum):

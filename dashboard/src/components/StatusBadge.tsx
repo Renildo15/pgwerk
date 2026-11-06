@@ -11,6 +11,8 @@ const config: Record<string, { label: string; dot: string; className: string }> 
   complete:  { label: 'complete',  dot: 'bg-emerald-400', className: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' },
   failed:    { label: 'failed',    dot: 'bg-red-400',     className: 'bg-red-500/10 text-red-400 border-red-500/30' },
   aborted:   { label: 'aborted',   dot: 'bg-violet-400',  className: 'bg-violet-500/10 text-violet-400 border-violet-500/30' },
+  // Execution-only: the worker vanished and its lease expired; the job was requeued.
+  lost:      { label: 'lost',      dot: 'bg-yellow-400',  className: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30' },
 }
 
 const PULSING = new Set(['active', 'running'])

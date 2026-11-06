@@ -17,6 +17,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `Werk.reconcile_waiting()`, part of every maintenance pass: `waiting` jobs whose dependencies have all settled are queued, or failed with `dependency failed` when a required dependency failed (cascading to their own dependents). Previously such jobs stayed in `waiting` forever.
 - Exporter gauge `wrk_waiting_jobs_stalled{queue}`: jobs in `waiting` for over an hour.
 
+### Changed
+
+- **Schema version 8** (applied automatically on connect): `lease_id`, `lease_expires_at`, `lost_count` and `max_lost` columns on the jobs table, and partial indexes on `lease_expires_at` (active leases) and `expires_at`. Workers from earlier versions keep running against it during a rolling deploy.
+- This release declares `max_compatible_db_version = 10`: it refuses to connect to a database whose schema is newer than 10. Earlier releases accepted any newer schema. Later breaking migrations rely on this bound to stop old code from running against them.
+
 ### Fixed
 
 - The sweep no longer undoes aborts. A stuck `aborting` job now ends `aborted` (running `on_stopped`, settling dependents, honoring `failure_mode="delete"` and `failure_ttl`) instead of being requeued and run again. At the attempt cap it previously ended `failed`; it now ends `aborted`.

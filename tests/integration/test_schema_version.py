@@ -99,3 +99,56 @@ class TestConnectVersionGate:
             await observer.connect()
         assert observer._connected is False
 
+
+
+async def _columns_and_indexes(conn, schema: str, prefix: str) -> tuple[set, set]:
+    cur = await conn.execute(
+        """
+        SELECT table_name, column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name LIKE %s
+        """,
+        (schema, f"{prefix}\\_%"),
+    )
+    cols = {(t.removeprefix(prefix), c, d, n, dflt) for t, c, d, n, dflt in await cur.fetchall()}
+    cur = await conn.execute(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s AND tablename LIKE %s",
+        (schema, f"{prefix}\\_%"),
+    )
+    idx = {(n.removeprefix(prefix), d.replace(prefix, "P")) for n, d in await cur.fetchall()}
+    return cols, idx
+
+
+class TestMigrationV8:
+    """A schema-7 database migrated to 8 must match a fresh install."""
+
+    @pytest.mark.asyncio
+    async def test_v7_to_v8_matches_fresh_install(self):
+        fresh, migrated = "_mig_fresh", "_mig_v7"
+        async with await psycopg.AsyncConnection.connect(_TEST_DSN, autocommit=True) as conn:
+            try:
+                for prefix in (fresh, migrated):
+                    app = Werk(_TEST_DSN, prefix=prefix)
+                    await app.connect()
+                    await app.disconnect()
+
+                # Roll the second install back to schema 7: drop what migration 8 adds.
+                jobs = f'"{_TEST_SCHEMA}"."{migrated}_jobs"'
+                for col in ("lease_id", "lease_expires_at", "lost_count", "max_lost"):
+                    await conn.execute(f"ALTER TABLE {jobs} DROP COLUMN {col}")
+                await conn.execute(f'DROP INDEX IF EXISTS "{_TEST_SCHEMA}"."{migrated}_jobs_expires_at_idx"')
+                await conn.execute(f'UPDATE "{_TEST_SCHEMA}"."{migrated}_versions" SET version = 7')
+
+                app = Werk(_TEST_DSN, prefix=migrated)
+                await app.connect()
+                await app.disconnect()
+
+                cur = await conn.execute(f'SELECT version FROM "{_TEST_SCHEMA}"."{migrated}_versions"')
+                assert (await cur.fetchone())[0] == 8
+                assert await _columns_and_indexes(conn, _TEST_SCHEMA, migrated) == await _columns_and_indexes(
+                    conn, _TEST_SCHEMA, fresh
+                )
+            finally:
+                for prefix in (fresh, migrated):
+                    for tbl in ("job_deps", "worker_jobs", "jobs_executions", "jobs", "schedules", "worker", "versions"):
+                        await conn.execute(f'DROP TABLE IF EXISTS "{_TEST_SCHEMA}"."{prefix}_{tbl}" CASCADE')

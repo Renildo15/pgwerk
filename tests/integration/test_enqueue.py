@@ -96,3 +96,20 @@ class TestEnqueue:
         job = await app.enqueue(noop, _result_ttl=600)
         fetched = await app.get_job(job.id)
         assert fetched.result_ttl == 600
+
+
+class TestMaxLost:
+    async def test_defaults_to_config(self, app):
+        job = await app.enqueue(noop)
+        assert job.max_lost == app.config.default_max_lost == 3
+        assert job.lost_count == 0
+        assert job.lease_id is None
+
+    async def test_explicit_value(self, app):
+        assert (await app.enqueue(noop, _max_lost=0)).max_lost == 0
+
+    async def test_enqueue_many(self, app):
+        from pgwerk.schemas import EnqueueParams
+
+        a, b = await app.enqueue_many([EnqueueParams(func=noop), EnqueueParams(func=noop, max_lost=7)])
+        assert (a.max_lost, b.max_lost) == (3, 7)

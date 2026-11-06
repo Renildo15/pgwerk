@@ -54,14 +54,25 @@ class WerkConfig:
         maintenance: Run the maintenance pass (sweep, stranded ``waiting`` job
             reconciliation, rescheduling) inside the API process, every
             ``sweep_interval``. Lets stuck jobs recover with no worker running.
+        local_lease_ttl: Seconds a local worker's claim on a job stays valid without
+            renewal, for jobs without ``heartbeat_secs`` (which is used instead). If
+            the worker stops renewing, the sweep recovers the job after this long.
+        remote_lease_ttl: The same, for remote workers (used from schema 10).
+        default_max_lost: How many times a job may be requeued because its worker
+            vanished (its lease expired) before it fails with ``lease_lost``. Set per
+            job with ``_max_lost``. Lost workers don't use up retries.
         default_retry_backoff: When ``True`` (default), passing a plain integer
             to ``_retry`` synthesizes an exponential backoff schedule rather
             than retrying immediately. An explicit :class:`Retry` always wins.
     """
 
-    schema_version: ClassVar[int] = 7
+    schema_version: ClassVar[int] = 8
     min_compatible_db_version: ClassVar[int] = 6
-    max_compatible_db_version: ClassVar[int | None] = None
+    # From schema 8 on, every release declares the newest schema it tolerates, so a
+    # later breaking migration can stop older code from running against it. It covers
+    # the additive migrations already planned (9: function routing, 10: remote
+    # workers); a breaking migration bumps past it, and its release raises this bound.
+    max_compatible_db_version: ClassVar[int | None] = 10
 
     # Connection
     dsn: str | None = None
@@ -100,6 +111,11 @@ class WerkConfig:
     # Retry behavior
     default_retry_backoff: bool = True
 
+    # Leases
+    local_lease_ttl: int = 300
+    remote_lease_ttl: int = 60
+    default_max_lost: int = 3
+
     # Dangerous operations
     allow_truncate: bool = False
 
@@ -135,6 +151,9 @@ class WerkConfig:
             api_token=os.environ.get("PGWERK_API_TOKEN"),
             maintenance=_bool("PGWERK_MAINTENANCE", False),
             default_retry_backoff=_bool("PGWERK_DEFAULT_RETRY_BACKOFF", True),
+            local_lease_ttl=_int("PGWERK_LOCAL_LEASE_TTL", 300),
+            remote_lease_ttl=_int("PGWERK_REMOTE_LEASE_TTL", 60),
+            default_max_lost=_int("PGWERK_DEFAULT_MAX_LOST", 3),
             allow_truncate=_bool("PGWERK_ALLOW_TRUNCATE", False),
             listen=_bool("PGWERK_LISTEN", True),
         )
@@ -161,5 +180,8 @@ class WerkConfig:
             os.environ["PGWERK_API_TOKEN"] = self.api_token
         os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
         os.environ["PGWERK_DEFAULT_RETRY_BACKOFF"] = "true" if self.default_retry_backoff else "false"
+        os.environ["PGWERK_LOCAL_LEASE_TTL"] = str(self.local_lease_ttl)
+        os.environ["PGWERK_REMOTE_LEASE_TTL"] = str(self.remote_lease_ttl)
+        os.environ["PGWERK_DEFAULT_MAX_LOST"] = str(self.default_max_lost)
         os.environ["PGWERK_ALLOW_TRUNCATE"] = "true" if self.allow_truncate else "false"
         os.environ["PGWERK_LISTEN"] = "true" if self.listen else "false"

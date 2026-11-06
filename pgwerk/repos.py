@@ -605,7 +605,7 @@ class JobRepository:
                     meta, result_ttl, failure_ttl, ttl,
                     on_success, on_failure, on_stopped,
                     on_success_timeout, on_failure_timeout, on_stopped_timeout,
-                    retry_intervals, failure_mode,
+                    retry_intervals, failure_mode, max_lost,
                     repeat_remaining, repeat_interval_secs, repeat_intervals
                 )
                 SELECT
@@ -614,7 +614,7 @@ class JobRepository:
                     meta, result_ttl, failure_ttl, ttl,
                     on_success, on_failure, on_stopped,
                     on_success_timeout, on_failure_timeout, on_stopped_timeout,
-                    retry_intervals, failure_mode,
+                    retry_intervals, failure_mode, max_lost,
                     %(remaining)s, repeat_interval_secs, %(repeat_intervals)s
                 FROM {jobs}
                 WHERE id = %(id)s
