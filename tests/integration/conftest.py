@@ -18,8 +18,8 @@ _TEST_DSN = os.environ.get("PGWERK_TEST_DSN", "postgresql://pgwerk:pgwerk@localh
 _TEST_SCHEMA = "pgwerk"
 _TEST_PREFIX = "_pgwerk"
 
-_TABLES = ["job_deps", "worker_jobs", "jobs_executions", "jobs", "schedules", "functions"]
-_DROP_TABLES = [*_TABLES, "worker", "versions", "enrollment_tokens"]
+_TABLES = ["job_deps", "worker_jobs", "jobs_executions", "jobs", "schedules", "functions", "enrollment_tokens"]
+_DROP_TABLES = [*_TABLES, "worker", "versions"]
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -483,6 +483,24 @@ class JobRepository:
         )
         return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
 
+    async def lock_held_by(self, cur: Any, worker_ids: list[str]) -> list[Job]:
+        """Lock the ``active``/``aborting`` jobs these workers hold."""
+        if not worker_ids:
+            return []
+        await cur.execute(
+            SQL(
+                "SELECT "
+                + JOB_COLS
+                + """
+                FROM {jobs}
+                WHERE worker_id = ANY(%(wids)s::uuid[]) AND status IN ('active', 'aborting')
+                FOR UPDATE
+                """
+            ).format(jobs=self._t["jobs"]),
+            {"wids": worker_ids},
+        )
+        return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
+
     async def requeue_stuck(self, cur: Any, jobs: list[Job]) -> None:
         """Put stuck jobs (locked by :meth:`lock_stuck`) back in ``queued`` right away.
 
@@ -558,11 +576,12 @@ class JobRepository:
         scheduled_at: datetime | None,
         expires_at: datetime | None,
         give_back_attempt: bool = False,
+        count_lost: bool = True,
     ) -> None:
         """Write a settled status onto a row locked by :meth:`lock_for_settle`.
 
-        ``give_back_attempt`` (a lost attempt being requeued) decrements ``attempts``
-        and increments ``lost_count``.
+        ``give_back_attempt`` (a lost or released attempt being requeued) decrements
+        ``attempts``; with ``count_lost`` it also increments ``lost_count``.
 
         ``complete`` stores the result and keeps the previous error; ``aborted``
         clears the result; a failure or retry keeps the result and stores the error.
@@ -587,12 +606,13 @@ class JobRepository:
                     completed_at = CASE WHEN %(status)s IN ('complete', 'failed', 'aborted')
                                         THEN NOW() ELSE NULL END,
                     attempts     = CASE WHEN %(give_back)s THEN GREATEST(attempts - 1, 0) ELSE attempts END,
-                    lost_count   = CASE WHEN %(give_back)s THEN lost_count + 1 ELSE lost_count END
+                    lost_count   = CASE WHEN %(give_back)s AND %(count_lost)s THEN lost_count + 1 ELSE lost_count END
                 WHERE id = %(id)s
             """).format(jobs=self._t["jobs"]),
             {
                 "id": job_id,
                 "give_back": give_back_attempt,
+                "count_lost": count_lost,
                 "status": status,
                 "result": result_json,
                 "error": error,

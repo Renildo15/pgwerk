@@ -152,3 +152,10 @@ class TestLost:
 
     def test_max_lost_zero_fails_the_first_loss(self):
         assert plan(_job(lost_count=0, max_lost=0), Outcome("lost"), NOW).status == JobStatus.Failed
+
+
+class TestRelease:
+    def test_requeues_without_counting_lost(self):
+        t = plan(_job(lost_count=3, max_lost=3), Outcome("release", error="revoked"), NOW)
+        assert (t.status, t.error, t.scheduled_at) == (JobStatus.Queued, "revoked", NOW)
+        assert t.lost and t.released and t.callback is None

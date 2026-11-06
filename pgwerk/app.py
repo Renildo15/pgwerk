@@ -7,6 +7,7 @@ import logging
 from typing import Any
 from typing import Callable
 from typing import Sequence
+from typing import TYPE_CHECKING
 from typing import cast
 from datetime import datetime
 from datetime import timezone
@@ -52,6 +53,10 @@ from .exceptions import JobError
 from .serializers import Serializer
 from .serializers import JSONSerializer
 from .serializers import encode
+
+
+if TYPE_CHECKING:
+    from .remote.repository import RemoteRepository
 
 
 logger = logging.getLogger(__name__)
@@ -121,6 +126,7 @@ class Werk:
         self.__job_repo: JobRepository | None = None
         self.__worker_repo: WorkerRepository | None = None
         self.__settlement: Settlement | None = None
+        self.__remote_repo: RemoteRepository | None = None
         self.__stats_repo: StatsRepository | None = None
         self.__schedule_repo: ScheduleRepository | None = None
 
@@ -145,6 +151,14 @@ class Werk:
                 self._connect, self._t, self.prefix, self.serializer, self._job_repo
             )
         return self.__worker_repo
+
+    @property
+    def _remote_repo(self) -> "RemoteRepository":
+        from .remote.repository import RemoteRepository
+
+        if self.__remote_repo is None:
+            self.__remote_repo = RemoteRepository(self._connect, self._t, self._settlement)
+        return self.__remote_repo
 
     @property
     def _settlement(self) -> Settlement:
@@ -1117,6 +1131,53 @@ class Werk:
     # ------------------------------------------------------------------
     # Workers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Remote workers (experimental)
+    # ------------------------------------------------------------------
+
+    async def create_enrollment_token(
+        self, name: str, queues: list[str], expires_in: int | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        """Create an enrollment token that lets remote workers register for *queues*.
+
+        Args:
+            name: A label for the machine or fleet it's for.
+            queues: The exact queues its workers may consume.
+            expires_in: Seconds until it stops accepting new registrations. Workers
+                already registered keep working. ``None``: it never expires.
+
+        Returns:
+            ``(token, row)``. The token is shown only here; store it securely.
+        """
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in) if expires_in else None
+        return await self._remote_repo.create_enrollment_token(name, queues, expires_at)
+
+    async def list_enrollment_tokens(self) -> list[dict[str, Any]]:
+        """Enrollment tokens with their scope, use and live worker count (never the secret)."""
+        return await self._remote_repo.list_enrollment_tokens()
+
+    async def revoke_enrollment_token(self, token_id: str) -> bool:
+        """Revoke an enrollment token and every worker registered with it, at once.
+
+        Their jobs go back to the queue without counting as lost. Use this when a
+        machine may be compromised.
+        """
+        revoked, released = await self._remote_repo.revoke_enrollment_token(token_id)
+        for job, settled in released:
+            await self._settlement.run_callback(job, settled)
+        return revoked
+
+    async def revoke_worker(self, worker_id: str, drain: bool = False) -> bool:
+        """Retire one remote worker; with *drain*, let it finish the jobs it holds first.
+
+        This doesn't stop a compromised machine, which can register again with its
+        enrollment token: use :meth:`revoke_enrollment_token` for that.
+        """
+        revoked, released = await self._remote_repo.revoke_worker(worker_id, drain=drain)
+        for job, settled in released:
+            await self._settlement.run_callback(job, settled)
+        return revoked
 
     async def list_functions(self) -> list[dict[str, Any]]:
         """Return the function catalog: every function a worker has declared.

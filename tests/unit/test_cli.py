@@ -221,3 +221,16 @@ class TestWorkerFunctionOption:
 
         CliRunner().invoke(cli, ["worker", "x:app"])
         assert fake.run.await_args.kwargs["functions"] is None
+
+
+class TestRemoteAdminCommands:
+    def test_help(self):
+        for args in (["token", "--help"], ["token", "create", "--help"], ["workers", "revoke", "--help"]):
+            result = CliRunner().invoke(cli, args)
+            assert result.exit_code == 0, (args, result.output)
+        assert "--drain" in CliRunner().invoke(cli, ["workers", "revoke", "--help"]).output
+
+    def test_token_create_requires_name_and_queues(self, monkeypatch):
+        monkeypatch.setenv("PGWERK_DSN", "postgresql://x/y")
+        result = CliRunner().invoke(cli, ["token", "create"])
+        assert result.exit_code != 0 and "--name" in result.output

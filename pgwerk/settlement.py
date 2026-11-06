@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-OutcomeKind = Literal["complete", "fail", "abort", "lost"]
+OutcomeKind = Literal["complete", "fail", "abort", "lost", "release"]
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,9 @@ class Transition:
     callback: str | None = None
     callback_timeout: int | None = None
     lost: bool = False
+    released: bool = False
+    """An operator took the attempt away (revoke, deregister): requeue it, give the
+    attempt back, and don't count it in ``lost_count``."""
     """The attempt was lost (its lease expired): the execution is marked ``lost``,
     and a requeue gives the attempt back and counts it in ``lost_count``."""
 
@@ -175,6 +178,12 @@ def plan(job: Job, outcome: Outcome, now: datetime | None = None, default_max_lo
             callback_timeout=job.on_failure_timeout,
         )
 
+    if outcome.kind == "release":
+        # Revoke/deregister: an operator action, not a failure and not a loss.
+        return Transition(
+            status=JobStatus.Queued, error=outcome.error or "released", scheduled_at=now, lost=True, released=True
+        )
+
     if outcome.kind == "lost":
         # The worker vanished: that says nothing about the job, so it doesn't use a
         # retry. A job that keeps killing its worker looks the same, hence the cap.
@@ -244,6 +253,7 @@ class Settlement:
             scheduled_at=t.scheduled_at,
             expires_at=t.expires_at,
             give_back_attempt=t.lost and t.retrying,
+            count_lost=not t.released,
         )
         await self._jobs.close_execution(
             cur,
@@ -347,6 +357,26 @@ class Settlement:
         for job, result in settled:
             await self.run_callback(job, result)
         return [job.id for job, _ in stuck]
+
+    async def release_worker_jobs(self, cur: Any, worker_ids: list[str], reason: str) -> list[tuple[Job, Settled]]:
+        """Requeue every attempt these workers hold, in the caller's transaction.
+
+        Used when an operator revokes or retires workers, and when a worker
+        deregisters with work in flight. Each attempt is requeued at once with the
+        attempt given back, and is *not* counted in ``lost_count``: revoking a fleet
+        shouldn't push its jobs toward ``max_lost``. The execution is marked ``lost``
+        with *reason* as its error. A job that was ``aborting`` ends ``aborted``.
+
+        Returns:
+            The settled jobs; the caller runs their callbacks after commit.
+        """
+        out: list[tuple[Job, Settled]] = []
+        for job in await self._jobs.lock_held_by(cur, worker_ids):
+            # Rows from workers older than schema 8 have no lease; they are already locked.
+            wid = job.worker_id if job.lease_id else None
+            fence = Fence(job.id, worker_id=wid, attempt=job.attempts, lease_id=job.lease_id)
+            out.append((job, await self.apply(cur, job, fence, Outcome("release", error=reason))))
+        return out
 
     async def expire_unstarted(self, limit: int = 500) -> int:
         """Abort ``queued``/``scheduled`` jobs whose ``_ttl`` ran out before they started.
