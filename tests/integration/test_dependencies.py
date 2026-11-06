@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from unittest.mock import patch
 
 from psycopg.sql import SQL
@@ -237,3 +239,21 @@ class TestDependencies:
         await make_worker(app).run()
 
         assert (await app.get_job(a.id)).status == JobStatus.Waiting
+
+
+class TestInsertAtomicity:
+    async def test_failed_dep_insert_leaves_no_job_row(self, app):
+        """The job row and its dep rows commit together (no ``waiting`` job with zero deps)."""
+        import uuid
+
+        import psycopg
+
+        missing = str(uuid.uuid4())  # FK violation on the dep insert
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            await app.enqueue(noop, _key="atomic-insert", _depends_on=missing)
+
+        async with await app._connect() as conn:
+            cur = await conn.execute(
+                SQL("SELECT COUNT(*) FROM {jobs} WHERE key = 'atomic-insert'").format(jobs=app._t["jobs"])
+            )
+            assert (await cur.fetchone())[0] == 0

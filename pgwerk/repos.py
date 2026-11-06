@@ -94,7 +94,7 @@ class JobRepository:
         Returns:
             The inserted :class:`Job`, or ``None`` if a key conflict suppressed the insert.
         """
-        async with self._conn(conn) as c, c.cursor(row_factory=dict_row) as cur:
+        async with self._conn(conn, transaction=conn is None) as c, c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 SQL(self._INSERT_SQL + JOB_COLS).format(jobs=self._t["jobs"]),
                 data.as_params(),
