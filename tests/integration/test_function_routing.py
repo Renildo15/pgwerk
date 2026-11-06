@@ -106,3 +106,74 @@ class TestCatalog:
         assert resp.status_code == 200
         [entry] = resp.json()
         assert (entry["name"], entry["languages"]) == ("m.f", ["python"])
+
+
+class TestUnroutable:
+    """Each test uses its own queue: worker rows from other tests aren't truncated."""
+
+    async def _live(self, app, queues, functions=None, role="worker"):
+        await app._worker_repo.register(str(uuid.uuid4()), "w", queues, "{}", role=role, functions=functions)
+
+    def _mine(self, rows, q):
+        return [(r["function"], r["count"]) for r in rows if r["queue"] == q]
+
+    async def test_reports_a_function_no_live_worker_declared(self, app):
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(noop, _queue=q)
+        await app.enqueue(add, 1, 2, _queue=q)
+        await self._live(app, [q], functions=["tests.integration.tasks.noop"])
+
+        assert self._mine(await app.unroutable_jobs(), q) == [("tests.integration.tasks.add", 1)]
+
+    async def test_catch_all_worker_routes_everything(self, app):
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(add, 1, 2, _queue=q)
+        await self._live(app, [q], functions=["tests.integration.tasks.noop"])
+        await self._live(app, ["other", q])
+        assert self._mine(await app.unroutable_jobs(), q) == []
+
+    async def test_queue_with_no_worker_and_schedulers_dont_count(self, app):
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(noop, _queue=q)
+        await self._live(app, [q], role="scheduler")
+        assert self._mine(await app.unroutable_jobs(), q) == [("tests.integration.tasks.noop", 1)]
+
+    async def test_stale_workers_dont_count(self, app):
+        import psycopg
+
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(noop, _queue=q)
+        wid = str(uuid.uuid4())
+        await app._worker_repo.register(wid, "w", [q], "{}")
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '5 minutes' WHERE id = %s").format(
+                    w=app._t["worker"]
+                ),
+                (wid,),
+            )
+        assert self._mine(await app.unroutable_jobs(), q) == [("tests.integration.tasks.noop", 1)]
+
+    async def test_future_jobs_are_not_counted(self, app):
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(noop, _queue=q, _delay=3600)
+        assert self._mine(await app.unroutable_jobs(), q) == []
+
+    async def test_exporter_gauge(self, app):
+        pytest.importorskip("prometheus_client")
+        from pgwerk.exporter import WerkExporter
+
+        q = f"q-{uuid.uuid4()}"
+        await app.enqueue(add, 1, 2, _queue=q)
+        await self._live(app, [q], functions=["tests.integration.tasks.noop"])
+        exporter = WerkExporter(app)
+
+        def mine():
+            return {f: g._value.get() for (queue, f), g in exporter._unroutable._metrics.items() if queue == q}
+
+        await exporter.collect()
+        assert mine() == {"tests.integration.tasks.add": 1}
+
+        await self._live(app, [q])
+        await exporter.collect()
+        assert mine() == {}

@@ -167,6 +167,11 @@ Declared functions are recorded in a catalog (`Werk.list_functions()`, `GET /api
 with the languages of the workers that registered them. The catalog is informational:
 enqueueing never checks it, so you can enqueue a function no worker has registered yet.
 
+A job whose function no live worker handles just waits in `queued`. The exporter's
+`wrk_unroutable_jobs{queue,function}` gauge (also `Werk.unroutable_jobs()` and
+`GET /api/functions/unroutable`) counts those jobs, including queues no worker consumes at
+all. Alert on it.
+
 ## Maintenance
 
 Every `sweep_interval` seconds a maintenance pass:

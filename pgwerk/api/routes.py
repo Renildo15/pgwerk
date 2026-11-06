@@ -340,6 +340,18 @@ class FunctionController(Controller):
         """
         return [FunctionResponse(**r) for r in await werk.list_functions()]
 
+    @get("/unroutable")
+    async def list_unroutable(self, werk: Werk) -> list[dict[str, Any]]:
+        """Runnable jobs that no live worker would claim, by queue and function.
+
+        Args:
+            werk: Werk application instance.
+
+        Returns:
+            ``{"queue", "function", "count"}`` entries.
+        """
+        return await werk.unroutable_jobs()
+
 
 class WorkerController(Controller):
     path = "/workers"

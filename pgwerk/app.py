@@ -1129,6 +1129,21 @@ class Werk:
         """
         return await self._worker_repo.list_functions()
 
+    async def unroutable_jobs(self, stale_secs: int = 60) -> list[dict[str, Any]]:
+        """Runnable jobs that no live worker would claim, counted by queue and function.
+
+        Such a job sits in ``queued`` with no error. This happens when no worker
+        consumes its queue, or when every worker on the queue declared ``functions``
+        that don't include it.
+
+        Args:
+            stale_secs: A worker that hasn't heartbeated for this long isn't live.
+
+        Returns:
+            Dicts with ``queue``, ``function`` and ``count``.
+        """
+        return await self._stats_repo.get_unroutable(stale_secs=stale_secs)
+
     async def list_workers(self) -> list[dict[str, Any]]:
         """Return all registered worker rows.
 

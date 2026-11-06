@@ -1554,6 +1554,36 @@ class StatsRepository:
             return 60 * 60
         return 6 * 60 * 60
 
+
+    async def get_unroutable(self, stale_secs: int = 60) -> list[dict[str, Any]]:
+        """Count runnable jobs that no live worker would claim, by queue and function.
+
+        A worker is live when it is ``active``, a ``worker`` (not a scheduler) and
+        has heartbeated within *stale_secs*. It would claim a job when it consumes
+        the job's queue and either declared no functions or declared this one.
+        """
+        async with await self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                SQL("""
+                    SELECT j.queue, j.function, COUNT(*) AS count
+                    FROM {jobs} j
+                    WHERE j.status IN ('queued', 'scheduled')
+                      AND j.scheduled_at <= NOW()
+                      AND (j.expires_at IS NULL OR j.expires_at > NOW())
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {worker} w
+                          WHERE w.status = 'active'
+                            AND w.role = 'worker'
+                            AND w.heartbeat_at > NOW() - make_interval(secs => %(stale)s)
+                            AND j.queue = ANY(string_to_array(w.queue, ','))
+                            AND (w.functions IS NULL OR j.function = ANY(w.functions))
+                      )
+                    GROUP BY j.queue, j.function
+                    ORDER BY j.queue, j.function
+                """).format(jobs=self._t["jobs"], worker=self._t["worker"]),
+                {"stale": stale_secs},
+            )
+            return await cur.fetchall()
     async def get_queue_stats(self) -> tuple[list[dict[str, Any]], int, int]:
         async with await self._connect() as conn, conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(

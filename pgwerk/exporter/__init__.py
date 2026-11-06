@@ -90,6 +90,12 @@ class WerkExporter:
             f"Jobs failed in the last {latency_window_secs}s, by queue (windowed gauge, not a monotonic counter)",
             ["queue"],
         )
+        self._unroutable = _g(
+            "unroutable_jobs",
+            "Runnable jobs that no live worker would claim (no worker on the queue, or none that "
+            "declared the function), by queue and function",
+            ["queue", "function"],
+        )
         self._waiting_stalled = _g(
             "waiting_jobs_stalled",
             f"Jobs in 'waiting' for over {stalled_waiting_secs}s, by queue. A dependency that never "
@@ -208,6 +214,12 @@ class WerkExporter:
                         self._duration_seconds.labels(queue=q).set(float(row["avg_duration"]))
                     self._throughput.labels(queue=q).set(row["completed"])
                     self._failed_total.labels(queue=q).set(row["failed"])
+
+                # --- runnable jobs no live worker would claim ---
+                unroutable = await self._pgwerk._stats_repo.get_unroutable()
+                self._unroutable.clear()
+                for row in unroutable:
+                    self._unroutable.labels(queue=row["queue"], function=row["function"]).set(row["count"])
 
                 # --- waiting jobs stalled past the threshold ---
                 await cur.execute(
