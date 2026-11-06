@@ -11,6 +11,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- `failure_mode="delete"` is fenced: a late failure from an attempt that no longer owns the job no longer deletes it.
+- `failure_mode="delete"` settles dependents before deleting. Previously the dependency rows were deleted with the job and its dependents stayed in `waiting`.
 - Enqueueing a job with dependencies writes the job and its dependency rows in one transaction, so a crash in between can no longer leave a `waiting` job with no dependencies.
 - API bearer-token and dashboard Basic Auth checks compare in constant time.
 

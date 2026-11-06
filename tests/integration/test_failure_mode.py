@@ -60,3 +60,53 @@ class TestFailureMode:
             async_job_control.release.set()
             worker._request_shutdown()
             await asyncio.wait_for(worker_task, timeout=5.0)
+
+
+class TestFailureModeDeleteFencing:
+    async def test_superseded_nack_does_not_delete(self, app):
+        """A late nack from an attempt that no longer owns the row must not delete it."""
+        import uuid
+
+        from psycopg.sql import SQL
+
+        from pgwerk.commons import DequeueStrategy
+
+        job = await app.enqueue(fail_always, _retry=1, _failure_mode="delete")
+        wid = str(uuid.uuid4())
+        await app._worker_repo.register(wid, "stale", ["default"], "{}")
+        [claimed] = await app._worker_repo.dequeue(wid, ["default"], 1, DequeueStrategy.Priority)
+
+        # Another worker now owns the attempt (e.g. the job was swept and reclaimed).
+        async with await app._connect() as conn:
+            await conn.execute(
+                SQL("UPDATE {jobs} SET worker_id = %(other)s WHERE id = %(id)s").format(jobs=app._t["jobs"]),
+                {"other": str(uuid.uuid4()), "id": job.id},
+            )
+
+        ok = await app._worker_repo.nack(wid, claimed, "boom", "failed", None, None, delete=True)
+        assert ok is False
+        assert (await app.get_job(job.id)).status == JobStatus.Active
+
+    async def test_dependent_of_deleted_failure_fails(self, app):
+        parent = await app.enqueue(fail_always, _retry=1, _failure_mode="delete")
+        child = await app.enqueue(fail_always, _depends_on=parent)
+        await make_worker(app).run()
+
+        with pytest.raises(JobNotFound):
+            await app.get_job(parent.id)
+        done = await app.get_job(child.id)
+        assert done.status == JobStatus.Failed
+        assert done.error == "dependency failed"
+
+    async def test_allow_failure_dependent_of_deleted_failure_runs(self, app):
+        from pgwerk.schemas import Dependency
+
+        from .tasks import noop
+
+        parent = await app.enqueue(fail_always, _retry=1, _failure_mode="delete")
+        child = await app.enqueue(noop, _depends_on=Dependency(job=parent, allow_failure=True))
+        await make_worker(app).run()
+
+        with pytest.raises(JobNotFound):
+            await app.get_job(parent.id)
+        assert (await app.get_job(child.id)).status == JobStatus.Complete

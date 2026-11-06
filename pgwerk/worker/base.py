@@ -602,17 +602,6 @@ class BaseWorker(abc.ABC):
             aborted and job.failure_mode == "delete"
         )
 
-        if is_terminal_delete:
-            await worker_repo.delete_job(job.id)
-            logger.info(
-                "Worker %s: deleted %s [%s] on terminal failure (failure_mode=delete)", self.name, job.function, job.id
-            )
-            if aborted and job.on_stopped:
-                await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
-            elif job.on_failure:
-                await invoke_callback(job.on_failure, job, timeout=job.on_failure_timeout)
-            return
-
         will_retry = not aborted and job.attempts < job.max_attempts
 
         scheduled_at: datetime | None = None
@@ -636,10 +625,16 @@ class BaseWorker(abc.ABC):
         if is_terminal and job.failure_ttl is not None:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=job.failure_ttl)
 
-        if not await worker_repo.nack(self.id, job, error, new_status, scheduled_at, expires_at):
+        if not await worker_repo.nack(
+            self.id, job, error, new_status, scheduled_at, expires_at, delete=is_terminal_delete
+        ):
             return  # race detected; logged by repo
 
-        if will_retry:
+        if is_terminal_delete:
+            logger.info(
+                "Worker %s: deleted %s [%s] on terminal failure (failure_mode=delete)", self.name, job.function, job.id
+            )
+        elif will_retry:
             if scheduled_at:
                 delay_secs = (scheduled_at - datetime.now(timezone.utc)).total_seconds()
                 logger.info(

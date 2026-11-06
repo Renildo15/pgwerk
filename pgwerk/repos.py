@@ -968,10 +968,7 @@ class WorkerRepository:
             )
             unblocked_queues = await self._job_repo.settle_dependents(cur, job.id)
             if status == JobStatus.Aborted and job.failure_mode == "delete":
-                await cur.execute(
-                    SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                    {"id": job.id},
-                )
+                await self._delete_settled(cur, job.id)
             for q in unblocked_queues:
                 await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{q}")))
 
@@ -985,8 +982,19 @@ class WorkerRepository:
         new_status: str,
         scheduled_at: datetime | None,
         expires_at: datetime | None,
+        delete: bool = False,
     ) -> bool:
+        """Settle a failed or aborted attempt under the worker fence.
+
+        With ``delete=True`` (``failure_mode=delete`` on a terminal status), the row is
+        deleted in the same transaction, after its dependents are settled: the dep rows
+        cascade away with the job, so settling afterwards would leave dependents looking
+        as if the dependency had succeeded. A superseded attempt fails the fence and
+        deletes nothing.
+        """
         is_terminal = new_status in ("failed", "aborted")
+        if delete and not is_terminal:
+            raise ValueError(f"delete=True requires a terminal status, got {new_status!r}")
 
         async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:
             await cur.execute(
@@ -1045,17 +1053,23 @@ class WorkerRepository:
             )
             if is_terminal:
                 unblocked_queues = await self._job_repo.settle_dependents(cur, job.id)
+                if delete:
+                    await self._delete_settled(cur, job.id)
                 for q in unblocked_queues:
                     await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{q}")))
 
         return True
 
-    async def delete_job(self, job_id: str) -> None:
-        async with await self._connect() as conn, conn.transaction():
-            await conn.execute(
-                SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                {"id": job_id},
-            )
+    async def _delete_settled(self, cur: Any, job_id: str) -> None:
+        """Delete a job that was just settled in this transaction (``failure_mode=delete``).
+
+        Callers must run ``settle_dependents`` first: the job's dep rows cascade away
+        with it.
+        """
+        await cur.execute(
+            SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
+            {"id": job_id},
+        )
 
     async def requeue_cancelled(self, worker_id: str, job: Job) -> None:
         async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:
