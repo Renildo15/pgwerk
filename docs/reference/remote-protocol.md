@@ -125,8 +125,9 @@ Request:
 
 Request: `{"claim_id": "<uuid>", "wait": 30}`
 
-- `claim_id` (required): a fresh UUID per claim. On a network error the client **MUST** retry
-  the same claim with the **same** `claim_id`. If the server had already given it a job, the retry
+- `claim_id` (required): a fresh UUID per claim. On a network error, `429` or `5xx`, the client
+  **MUST** retry the same claim with the **same** `claim_id`, and only start a new `claim_id`
+  after a `200` or `204`. If the server had already given it a job, the retry
   returns the same lease, so a lost response doesn't lose the job. A `claim_id` whose attempt is
   over gets `204`; the client then claims again with a new id.
 - `wait` (optional, seconds): how long the server holds the request open when there is nothing

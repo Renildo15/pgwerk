@@ -21,3 +21,34 @@ uv run pytest conformance/server -v
 
 Without those variables the suite is skipped, so a plain `pytest` run doesn't need a server.
 CI runs it on every pull request against `werk api --remote-workers`.
+
+## Client conformance (`conformance/client`)
+
+A scripted fake server (`fake_server.py`) that the client under test connects to. It records
+every request and checks how the client behaves:
+- headers and tokens: enrollment token only for `register`;
+- declared functions;
+- fresh vs reused `claim_id`;
+- heartbeat cadence;
+- `complete` retries;
+- reactions to `lease_lost`, `abort`, `too_large`, `draining` and `401`;
+- structured errors;
+- the `args` rule for non-Python clients.
+
+The client runs as a subprocess with `URL` and `TOKEN` in its environment. It must consume the
+queue `conformance` and implement four functions:
+
+| Function | Behaviour |
+|---|---|
+| `conformance.echo` | returns its `kwargs` |
+| `conformance.sleep(seconds)` | sleeps, returns `null`; should stop when aborted |
+| `conformance.fail(message)` | fails with `message` (a retryable error) |
+| `conformance.big(size)` | returns a string of `size` characters |
+
+```bash
+# the Python RemoteWorker (default)
+uv run pytest conformance/client -v
+
+# any other client: a command that starts it
+PGWERK_CONFORMANCE_CLIENT="./my-go-worker" uv run pytest conformance/client -v
+```
