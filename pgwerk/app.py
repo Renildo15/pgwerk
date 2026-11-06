@@ -21,6 +21,7 @@ from .repos import StatsRepository
 from .repos import WorkerRepository
 from .repos import ScheduleRepository
 from .utils import fn_path
+from .utils import invoke_callback
 from .utils import normalize_retry
 from .utils import normalize_callback
 from .utils import normalize_failure_mode
@@ -852,18 +853,24 @@ class Werk:
         await self._job_repo.touch(job_id)
 
     async def sweep(self) -> list[str]:
-        """Detect stuck active jobs and requeue them.
+        """Recover stuck jobs whose worker stopped making progress.
 
-        A job is considered stuck when it has not updated its heartbeat within
-        ``max_active_secs`` seconds.
+        A job is considered stuck when its timeout, heartbeat or ``max_active_secs``
+        window has elapsed. Stuck ``active`` jobs are requeued, or failed at the
+        attempt cap. Stuck ``aborting`` jobs settle as ``aborted`` (never requeued),
+        and their ``on_stopped`` callback runs here, after the sweep commits.
 
         Returns:
-            List of job IDs that were requeued.
+            IDs of every job the sweep touched.
         """
-        swept = await self._job_repo.sweep(self.max_active_secs)
-        if swept:
-            logger.info("werk: sweep removed %d stuck job(s): %s", len(swept), swept)
-        return swept
+        result = await self._job_repo.sweep(self.max_active_secs)
+        if result.job_ids:
+            logger.info("werk: sweep recovered %d stuck job(s): %s", len(result.job_ids), result.job_ids)
+        for job in result.aborted:
+            if job.on_stopped:
+                await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
+        return result.job_ids
+
 
     async def delete_job(self, job_id: str) -> None:
         """Permanently delete a single job row by ID.

@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- The sweep no longer undoes aborts. A stuck `aborting` job now ends `aborted` (running `on_stopped`, settling dependents, honoring `failure_mode="delete"` and `failure_ttl`) instead of being requeued and run again. At the attempt cap it previously ended `failed`; it now ends `aborted`.
 - `failure_mode="delete"` is fenced: a late failure from an attempt that no longer owns the job no longer deletes it.
 - `failure_mode="delete"` settles dependents before deleting. Previously the dependency rows were deleted with the job and its dependents stayed in `waiting`.
 - Enqueueing a job with dependencies writes the job and its dependency rows in one transaction, so a crash in between can no longer leave a `waiting` job with no dependencies.
