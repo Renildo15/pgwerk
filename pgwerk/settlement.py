@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-OutcomeKind = Literal["complete", "fail", "abort"]
+OutcomeKind = Literal["complete", "fail", "abort", "lost"]
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,9 @@ class Transition:
     """Insert the next run of a repeating job."""
     callback: str | None = None
     callback_timeout: int | None = None
+    lost: bool = False
+    """The attempt was lost (its lease expired): the execution is marked ``lost``,
+    and a requeue gives the attempt back and counts it in ``lost_count``."""
 
     @property
     def terminal(self) -> bool:
@@ -117,13 +120,14 @@ class Settled:
         return self.transition.scheduled_at if self.transition is not None else None
 
 
-def plan(job: Job, outcome: Outcome, now: datetime | None = None) -> Transition:
+def plan(job: Job, outcome: Outcome, now: datetime | None = None, default_max_lost: int = 3) -> Transition:
     """Decide what an outcome does to *job*. Pure: no I/O.
 
     Args:
         job: The job as it was claimed (``attempts`` already counts this attempt).
         outcome: What happened.
         now: Reference time for retry delays and expiry; defaults to the current time.
+        default_max_lost: Cap on ``lost_count`` for jobs without ``max_lost``.
     """
     now = now or datetime.now(timezone.utc)
 
@@ -171,6 +175,22 @@ def plan(job: Job, outcome: Outcome, now: datetime | None = None) -> Transition:
             callback_timeout=job.on_failure_timeout,
         )
 
+    if outcome.kind == "lost":
+        # The worker vanished: that says nothing about the job, so it doesn't use a
+        # retry. A job that keeps killing its worker looks the same, hence the cap.
+        cap = job.max_lost if job.max_lost is not None else default_max_lost
+        if job.lost_count < cap:
+            return Transition(status=JobStatus.Queued, error="lease_lost", scheduled_at=now, lost=True)
+        return Transition(
+            status=JobStatus.Failed,
+            error="lease_lost",
+            expires_at=_expiry(job.failure_ttl),
+            delete=job.failure_mode == "delete",
+            callback=job.on_failure,
+            callback_timeout=job.on_failure_timeout,
+            lost=True,
+        )
+
     raise ValueError(f"unknown outcome kind: {outcome.kind!r}")
 
 
@@ -191,9 +211,10 @@ class Settlement:
         job_repo: Repository that owns the job tables.
     """
 
-    def __init__(self, connect: "Connect", job_repo: "JobRepository") -> None:
+    def __init__(self, connect: "Connect", job_repo: "JobRepository", default_max_lost: int = 3) -> None:
         self._connect = connect
         self._jobs = job_repo
+        self._default_max_lost = default_max_lost
 
     async def apply(self, cur: Any, job: Job, fence: Fence, outcome: Outcome) -> Settled:
         """Settle *job* inside the caller's transaction. Callbacks are not run.
@@ -212,7 +233,7 @@ class Settlement:
 
         if current == JobStatus.Aborting.value and outcome.kind != "abort":
             outcome = Outcome("abort")
-        t = plan(job, outcome)
+        t = plan(job, outcome, default_max_lost=self._default_max_lost)
 
         await self._jobs.write_settled(
             cur,
@@ -222,13 +243,14 @@ class Settlement:
             result_json=t.result_json,
             scheduled_at=t.scheduled_at,
             expires_at=t.expires_at,
+            give_back_attempt=t.lost and t.retrying,
         )
         await self._jobs.close_execution(
             cur,
             job.id,
             # A worker closes its own attempt; the sweeper closes whatever is still running.
             fence.lease_id,
-            status=_EXECUTION_STATUS[t.status],
+            status="lost" if t.lost else _EXECUTION_STATUS[t.status],
             result_json=t.result_json if t.status == JobStatus.Complete else None,
             error=t.error if t.status != JobStatus.Complete else None,
         )
@@ -280,17 +302,20 @@ class Settlement:
             return dataclasses.replace(job, status=t.status, result=decode(self._jobs._serializer, t.result_json))
         return dataclasses.replace(job, status=t.status, error=t.error)
 
-    async def sweep(self, max_active_secs: int) -> list[str]:
+    async def sweep(self, max_active_secs: int, local_lease_ttl: int = 300) -> list[str]:
         """Recover stuck jobs whose worker stopped making progress.
 
-        Each stuck job is locked, then:
+        Each stuck job is locked, then settled by why it is stuck:
 
-        - ``aborting``: settles as aborted (dependents, ``failure_mode``,
-          ``failure_ttl``, ``on_stopped``). It is never requeued.
-        - ``active`` at the attempt cap: settles as a failure with
-          ``error = 'swept'``, like any other failure (``failure_mode``,
-          ``failure_ttl``, dependents, ``on_failure``).
-        - ``active`` under the cap: requeued at once.
+        - ``aborting``: an abort (dependents, ``failure_mode``, ``failure_ttl``,
+          ``on_stopped``). It is never requeued.
+        - past ``timeout_secs``: a failed attempt with ``error = 'timeout'``. It
+          follows ``retry_intervals``, like a timeout the worker reported.
+        - lease expired: the attempt was lost. The job is requeued at once without
+          using a retry (``lost_count + 1``), or fails with ``lease_lost`` once
+          ``max_lost`` is reached.
+        - no lease (claimed by a worker older than schema 8): the old rules. It is
+          requeued, or fails with ``error = 'swept'`` at the attempt cap.
 
         Callbacks run after the transaction commits.
 
@@ -299,21 +324,29 @@ class Settlement:
         """
         settled: list[tuple[Job, Settled]] = []
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
-            stuck = await self._jobs.lock_stuck(cur, max_active_secs)
+            stuck = await self._jobs.lock_stuck(cur, max_active_secs, local_lease_ttl)
             requeue: list[Job] = []
-            for job in stuck:
+            for job, reason in stuck:
                 fence = Fence(job.id, worker_id=None, attempt=job.attempts)
                 if job.status == JobStatus.Aborting:
-                    settled.append((job, await self.apply(cur, job, fence, Outcome("abort"))))
+                    outcome: Outcome | None = Outcome("abort")
+                elif reason == "timeout":
+                    outcome = Outcome("fail", error="timeout")
+                elif reason == "lease":
+                    outcome = Outcome("lost")
                 elif job.attempts >= job.max_attempts:
-                    settled.append((job, await self.apply(cur, job, fence, Outcome("fail", error="swept"))))
+                    outcome = Outcome("fail", error="swept")
                 else:
+                    outcome = None
+                if outcome is None:
                     requeue.append(job)
+                else:
+                    settled.append((job, await self.apply(cur, job, fence, outcome)))
             await self._jobs.requeue_stuck(cur, requeue)
 
         for job, result in settled:
             await self.run_callback(job, result)
-        return [job.id for job in stuck]
+        return [job.id for job, _ in stuck]
 
     async def expire_unstarted(self, limit: int = 500) -> int:
         """Abort ``queued``/``scheduled`` jobs whose ``_ttl`` ran out before they started.

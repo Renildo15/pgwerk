@@ -126,6 +126,16 @@ A job whose `_ttl` runs out before a worker starts it is never run. The next
 `_ttl` only covers the wait before the first attempt: a retry clears it. It is ignored on jobs
 with `_depends_on`.
 
+### Lost workers
+
+If the worker running a job disappears (crash, OOM kill, evicted pod, spot reclaim), the job is
+requeued without using a retry. `_max_lost` caps how many times that can happen before the job
+fails with `error = "lease_lost"` (default `3`, from `WerkConfig.default_max_lost`):
+
+```python
+await app.enqueue(render_video, _max_lost=1)   # one lost worker is fine, two is suspicious
+```
+
 ### Failure mode
 
 By default, failed jobs are kept in the database (`failure_mode="hold"`) so you can inspect and retry them. Set `failure_mode="delete"` to remove the row on terminal failure:

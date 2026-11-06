@@ -20,9 +20,9 @@ class WerkConfig:
             ``"public"``). ``None`` means no schema prefix.
         prefix: Prefix applied to every wrk table name (default ``"_pgwerk"``),
             producing tables like ``_pgwerk_jobs``, ``_pgwerk_worker``, etc.
-        max_active_secs: How long (seconds) a job may stay in the
-            ``active`` state before the sweep marks it as failed. Applies
-            to jobs that never heartbeat or whose worker crashes.
+        max_active_secs: Deprecated. How long (seconds) a job claimed by a worker
+            older than schema 8 (no lease) may stay ``active`` before the sweep
+            recovers it. Leased jobs are recovered when their lease expires.
         heartbeat_interval: How often (seconds) a running worker updates
             its heartbeat timestamp in ``_pgwerk_worker``.
         poll_interval: How often (seconds) the polling loop checks

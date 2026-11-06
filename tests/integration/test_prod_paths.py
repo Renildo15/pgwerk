@@ -77,7 +77,8 @@ class TestProdPaths:
                     SQL("""
                         UPDATE {jobs}
                         SET started_at = NOW() - INTERVAL '2 hours',
-                            touched_at = NOW() - INTERVAL '2 hours'
+                            touched_at = NOW() - INTERVAL '2 hours',
+                            lease_expires_at = NOW() - INTERVAL '1 minute'
                         WHERE id = %(id)s
                     """).format(jobs=app._t["jobs"]),
                     {"id": job.id},

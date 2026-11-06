@@ -81,7 +81,8 @@ class TestLeaseFence:
         job = await app.enqueue(noop, _retry=3)
         wid = await _worker(app)
         [first] = await _claim(app, wid)
-        await _age(app, job.id, started_at="2 hours")  # past max_active_secs
+        # The worker stopped renewing: its lease expired and it went quiet.
+        await _age(app, job.id, started_at="2 hours", touched_at="2 hours", lease_expires_at="1 minute")
         assert job.id in await app.sweep()
         [second] = await _claim(app, wid)
         assert second.lease_id != first.lease_id

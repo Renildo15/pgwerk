@@ -121,7 +121,7 @@ class TestAbort:
 
 def test_unknown_outcome_kind_raises():
     with pytest.raises(ValueError):
-        plan(_job(), Outcome("lost"), NOW)  # type: ignore[arg-type]
+        plan(_job(), Outcome("bogus"), NOW)  # type: ignore[arg-type]
 
 
 def test_worker_fence_requires_a_lease():
@@ -131,3 +131,24 @@ def test_worker_fence_requires_a_lease():
         Fence("j", "worker", 1)
     Fence("j", "worker", 1, "lease")
     Fence("j", None, 1)  # the sweeper, on rows it already locked
+
+
+class TestLost:
+    def test_requeues_now_without_using_a_retry(self):
+        t = plan(_job(attempts=1, max_attempts=1, lost_count=0, max_lost=3, retry_intervals=[60]), Outcome("lost"), NOW)
+        assert (t.status, t.scheduled_at, t.error) == (JobStatus.Queued, NOW, "lease_lost")
+        assert t.lost and t.retrying and t.callback is None
+
+    def test_fails_at_max_lost_like_any_failure(self):
+        job = _job(lost_count=3, max_lost=3, failure_mode="delete", failure_ttl=10)
+        t = plan(job, Outcome("lost"), NOW)
+        assert (t.status, t.error) == (JobStatus.Failed, "lease_lost")
+        assert t.delete and t.expires_at == _at(10)
+        assert (t.callback, t.callback_timeout) == ("cb.fail", 2)
+
+    def test_default_cap_applies_without_max_lost(self):
+        assert plan(_job(lost_count=2, max_lost=None), Outcome("lost"), NOW, default_max_lost=3).retrying
+        assert plan(_job(lost_count=3, max_lost=None), Outcome("lost"), NOW, default_max_lost=3).terminal
+
+    def test_max_lost_zero_fails_the_first_loss(self):
+        assert plan(_job(lost_count=0, max_lost=0), Outcome("lost"), NOW).status == JobStatus.Failed

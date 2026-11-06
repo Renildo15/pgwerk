@@ -147,11 +147,30 @@ Handlers are called in reverse push order (most recently pushed first). Use `pop
 
 Every `sweep_interval` seconds a maintenance pass:
 
-- **recovers stuck jobs** (the sweep). An `active` job whose timeout, heartbeat or
-  `max_active_secs` window has elapsed is requeued. At its attempt cap it fails with
-  `error = 'swept'` like any other failure: `on_failure` runs, `failure_mode="delete"` applies
-  and `failure_ttl` sets its expiry. An `aborting` job in the same situation ends `aborted` and is never requeued:
-  its dependents settle, `failure_mode="delete"` removes it, and `on_stopped` runs.
+- **recovers stuck jobs** (the sweep).
+  - **Lost attempt:** the lease of a running job expired, because its worker stopped renewing it
+    (crash, OOM kill, eviction, lost network). The job is requeued at once **without using a
+    retry**, and `lost_count` goes up. After `max_lost` losses (default 3, `_max_lost` per job) it
+    fails with `error = 'lease_lost'`, like any other failure. A job that keeps killing its
+    worker therefore stops instead of cycling forever.
+  - **Timeout:** past `timeout_secs` (normally enforced by the worker itself), it counts as a
+    failed attempt with `error = 'timeout'` and follows its retries.
+  - **Abort:** an `aborting` job in either situation ends `aborted` and is never requeued.
+  - Every terminal outcome settles normally: dependents settle, `failure_mode` and `failure_ttl`
+    apply, and `on_failure`/`on_stopped` run.
+
+## Leases
+
+When a worker claims a job, that attempt gets a lease: an id (also the id of the attempt's
+execution row) and an expiry. The lease lasts `heartbeat_secs` if the job has it, or
+`local_lease_ttl` (300s). Each worker renews the leases of all its running jobs in one query,
+at a quarter of the shortest TTL it holds and at least every `heartbeat_interval`.
+
+Every write for an attempt is fenced on its lease. If the sweep recovered the job, the old
+attempt's late result is rejected, and at its next renewal the old worker cancels the job
+without writing anything. A worker that dies is noticed within one lease TTL, not after
+`max_active_secs`. `max_active_secs` now only applies to jobs claimed by workers older than
+schema 8, during a rolling deploy.
 - **expires unstarted jobs.** A `queued` or `scheduled` job whose `_ttl` ran out ends `aborted`
   with `error = 'expired'`: dependents settle, `failure_mode="delete"` applies, `on_stopped` runs.
 - **settles stranded dependents.** A `waiting` job whose dependencies have all settled, but

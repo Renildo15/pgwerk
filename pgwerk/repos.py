@@ -400,28 +400,62 @@ class JobRepository:
                                AND started_at + %(max_active_secs)s * INTERVAL '1 second' < NOW())
     """
 
-    async def lock_stuck(self, cur: Any, max_active_secs: int) -> list[Job]:
+    async def lock_stuck(self, cur: Any, max_active_secs: int, local_lease_ttl: int = 300) -> list[tuple[Job, str]]:
         """Lock stuck ``active``/``aborting`` jobs, skipping rows locked elsewhere.
 
-        A job is stuck when its timeout, heartbeat or max-active window has elapsed.
+        Returns each job with why it is stuck:
+
+        - ``"timeout"``: past ``timeout_secs`` (the backstop for a worker that died
+          or hung without enforcing it).
+        - ``"lease"``: its lease expired. While workers older than schema 8 may run
+          (rolling deploys), ``touched_at`` must be stale too: an old worker that
+          stole a leased row never renews ``lease_expires_at``, but its per-job
+          heartbeat keeps ``touched_at`` fresh.
+        - ``"legacy"``: no lease (claimed by a worker older than schema 8), stuck by
+          the old heartbeat/``max_active_secs`` rules.
         """
         await cur.execute(
             SQL(
                 """
-                SELECT """
+                WITH stuck AS (
+                    SELECT id AS _id,
+                           CASE
+                               WHEN timeout_secs IS NOT NULL
+                                    AND started_at + timeout_secs * INTERVAL '1 second' < NOW()
+                                   THEN 'timeout'
+                               WHEN lease_id IS NOT NULL THEN 'lease'
+                               ELSE 'legacy'
+                           END AS _reason
+                    FROM {jobs}
+                    WHERE status IN ('active', 'aborting')
+                      AND (
+                          (timeout_secs IS NOT NULL
+                           AND started_at + timeout_secs * INTERVAL '1 second' < NOW())
+                          OR
+                          (lease_id IS NOT NULL
+                           AND lease_expires_at < NOW()
+                           AND COALESCE(touched_at, started_at)
+                               + COALESCE(heartbeat_secs, %(local_lease_ttl)s) * INTERVAL '1 second' < NOW())
+                          OR
+                          (lease_id IS NULL AND ("""
+                + self._STUCK_PREDICATE
+                + """))
+                      )
+                    FOR UPDATE SKIP LOCKED
+                )
+                SELECT stuck._reason, """
                 + JOB_COLS
                 + """
-                FROM {jobs}
-                WHERE status IN ('active', 'aborting')
-                  AND ("""
-                + self._STUCK_PREDICATE
-                + """)
-                FOR UPDATE SKIP LOCKED
+                FROM {jobs} JOIN stuck ON stuck._id = {jobs}.id
                 """
             ).format(jobs=self._t["jobs"]),
-            {"max_active_secs": max_active_secs},
+            {"max_active_secs": max_active_secs, "local_lease_ttl": local_lease_ttl},
         )
-        return [Job.from_row(r, self._serializer) for r in await cur.fetchall()]
+        out: list[tuple[Job, str]] = []
+        for row in await cur.fetchall():
+            reason = row.pop("_reason")
+            out.append((Job.from_row(row, self._serializer), reason))
+        return out
 
     async def lock_expired_unstarted(self, cur: Any, limit: int) -> list[Job]:
         """Lock ``queued``/``scheduled`` jobs past their ``expires_at`` (the ``_ttl``).
@@ -523,8 +557,12 @@ class JobRepository:
         result_json: str | None,
         scheduled_at: datetime | None,
         expires_at: datetime | None,
+        give_back_attempt: bool = False,
     ) -> None:
         """Write a settled status onto a row locked by :meth:`lock_for_settle`.
+
+        ``give_back_attempt`` (a lost attempt being requeued) decrements ``attempts``
+        and increments ``lost_count``.
 
         ``complete`` stores the result and keeps the previous error; ``aborted``
         clears the result; a failure or retry keeps the result and stores the error.
@@ -547,11 +585,14 @@ class JobRepository:
                     started_at   = CASE WHEN %(status)s IN ('queued', 'scheduled') THEN NULL ELSE started_at END,
                     scheduled_at = COALESCE(%(scheduled_at)s::timestamptz, scheduled_at),
                     completed_at = CASE WHEN %(status)s IN ('complete', 'failed', 'aborted')
-                                        THEN NOW() ELSE NULL END
+                                        THEN NOW() ELSE NULL END,
+                    attempts     = CASE WHEN %(give_back)s THEN GREATEST(attempts - 1, 0) ELSE attempts END,
+                    lost_count   = CASE WHEN %(give_back)s THEN lost_count + 1 ELSE lost_count END
                 WHERE id = %(id)s
             """).format(jobs=self._t["jobs"]),
             {
                 "id": job_id,
+                "give_back": give_back_attempt,
                 "status": status,
                 "result": result_json,
                 "error": error,

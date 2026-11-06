@@ -147,7 +147,9 @@ class Werk:
     @property
     def _settlement(self) -> Settlement:
         if self.__settlement is None:
-            self.__settlement = Settlement(self._connect, self._job_repo)
+            self.__settlement = Settlement(
+                self._connect, self._job_repo, default_max_lost=self.config.default_max_lost
+            )
         return self.__settlement
 
     @property
@@ -878,7 +880,7 @@ class Werk:
         Returns:
             IDs of every job the sweep touched.
         """
-        swept = await self._settlement.sweep(self.max_active_secs)
+        swept = await self._settlement.sweep(self.max_active_secs, self.config.local_lease_ttl)
         if swept:
             logger.info("werk: sweep recovered %d stuck job(s): %s", len(swept), swept)
         return swept
