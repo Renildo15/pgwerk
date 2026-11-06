@@ -42,6 +42,17 @@ class TestRepeatInsideTransaction:
         assert settled.status == JobStatus.Complete
         assert await _count(app, job.function) == 2
 
+    async def test_next_run_keeps_failure_mode(self, app):
+        job, fence = await _claim(app, _repeat=Repeat(times=2), _failure_mode="delete")
+        await app._settlement.settle(job, fence, Outcome("complete"))
+
+        async with await app._connect() as conn:
+            cur = await conn.execute(
+                SQL("SELECT failure_mode FROM {jobs} WHERE function = %s AND id <> %s").format(jobs=app._t["jobs"]),
+                (job.function, job.id),
+            )
+            assert (await cur.fetchone())[0] == "delete"
+
     async def test_failure_after_repeat_insert_rolls_everything_back(self, app, monkeypatch):
         job, fence = await _claim(app, _repeat=Repeat(times=2))
 
