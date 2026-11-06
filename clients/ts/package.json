@@ -1,0 +1,19 @@
+{
+  "name": "@pgwerk/remote-worker",
+  "version": "0.1.0",
+  "description": "Run pgwerk jobs from any machine with outbound HTTPS: a remote worker for protocol v1.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20.3" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "pgwerk": { "protocols": [1] },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": { "typescript": "^5.7.0" }
+}
