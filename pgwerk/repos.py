@@ -1223,18 +1223,22 @@ class WorkerRepository:
                 },
             )
             if functions:
-                await conn.execute(
-                    SQL("""
-                        INSERT INTO {functions} AS f (name, languages, last_registered_at)
-                        SELECT DISTINCT unnest(%(functions)s::text[]), ARRAY[%(lang)s]::text[], NOW()
-                        ON CONFLICT (name) DO UPDATE
-                            SET languages = ARRAY(
-                                    SELECT DISTINCT l FROM unnest(f.languages || EXCLUDED.languages) AS l ORDER BY l
-                                ),
-                                last_registered_at = NOW()
-                    """).format(functions=self._t["functions"]),
-                    {"functions": functions, "lang": lang},
-                )
+                await self.upsert_functions(conn, functions, lang)
+
+    async def upsert_functions(self, conn_or_cur: Any, functions: list[str], lang: str) -> None:
+        """Record *functions* in the informational catalog, merging *lang* into their languages."""
+        await conn_or_cur.execute(
+            SQL("""
+                INSERT INTO {functions} AS f (name, languages, last_registered_at)
+                SELECT DISTINCT unnest(%(functions)s::text[]), ARRAY[%(lang)s]::text[], NOW()
+                ON CONFLICT (name) DO UPDATE
+                    SET languages = ARRAY(
+                            SELECT DISTINCT l FROM unnest(f.languages || EXCLUDED.languages) AS l ORDER BY l
+                        ),
+                        last_registered_at = NOW()
+            """).format(functions=self._t["functions"]),
+            {"functions": functions, "lang": lang},
+        )
 
     async def list_functions(self) -> list[dict[str, Any]]:
         """Return the function catalog, by name."""
@@ -1310,6 +1314,22 @@ class WorkerRepository:
         Only ``queued``/``scheduled`` jobs are claimed. A job whose worker died is
         recovered by the sweep, not stolen here, so attempts are counted in one place.
         """
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            return await self.dequeue_in(
+                cur, worker_id, ordered_queues, limit, strategy, lease_ttl=lease_ttl, functions=functions
+            )
+
+    async def dequeue_in(
+        self,
+        cur: Any,
+        worker_id: str,
+        ordered_queues: list[str],
+        limit: int,
+        strategy: DequeueStrategy,
+        lease_ttl: int = 300,
+        functions: list[str] | None = None,
+    ) -> list[Job]:
+        """:meth:`dequeue` inside the caller's transaction (``cur`` must use ``dict_row``)."""
         if strategy == DequeueStrategy.Priority:
             order_sql = SQL("ORDER BY priority DESC, scheduled_at ASC")
             extra_params: dict[str, Any] = {}
@@ -1319,80 +1339,79 @@ class WorkerRepository:
             )
             extra_params = {"ordered_queues": ordered_queues}
 
-        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                SQL(
-                    """
-                    WITH locked AS (
-                        SELECT id AS _id, gen_random_uuid() AS _lease_id
-                        FROM {jobs}
-                        WHERE queue = ANY(%(queues)s)
-                          AND status IN ('queued', 'scheduled')
-                          AND (%(functions)s::text[] IS NULL OR function = ANY(%(functions)s::text[]))
-                          AND scheduled_at <= NOW()
-                          AND (expires_at IS NULL OR expires_at > NOW())
-                          AND (
-                              group_key IS NULL
-                              OR group_key NOT IN (
-                                  SELECT DISTINCT group_key FROM {jobs}
-                                  WHERE queue = ANY(%(queues)s)
-                                    AND status = 'active'
-                                    AND group_key IS NOT NULL
-                              )
+        await cur.execute(
+            SQL(
+                """
+                WITH locked AS (
+                    SELECT id AS _id, gen_random_uuid() AS _lease_id
+                    FROM {jobs}
+                    WHERE queue = ANY(%(queues)s)
+                      AND status IN ('queued', 'scheduled')
+                      AND (%(functions)s::text[] IS NULL OR function = ANY(%(functions)s::text[]))
+                      AND scheduled_at <= NOW()
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                      AND (
+                          group_key IS NULL
+                          OR group_key NOT IN (
+                              SELECT DISTINCT group_key FROM {jobs}
+                              WHERE queue = ANY(%(queues)s)
+                                AND status = 'active'
+                                AND group_key IS NOT NULL
                           )
-                        {order_sql}
-                        LIMIT %(limit)s
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE {jobs}
-                    SET status           = 'active',
-                        started_at       = NOW(),
-                        attempts         = attempts + 1,
-                        worker_id        = %(wid)s,
-                        lease_id         = locked._lease_id,
-                        lease_expires_at = NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second'
-                    FROM locked
-                    WHERE {jobs}.id = locked._id
-                    RETURNING
-                    """
-                    + JOB_COLS
-                ).format(jobs=self._t["jobs"], order_sql=order_sql),
-                {
-                    "queues": ordered_queues,
-                    "limit": limit,
-                    "wid": worker_id,
-                    "ttl": lease_ttl,
-                    "functions": functions,
-                    **extra_params,
-                },
+                      )
+                    {order_sql}
+                    LIMIT %(limit)s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {jobs}
+                SET status           = 'active',
+                    started_at       = NOW(),
+                    attempts         = attempts + 1,
+                    worker_id        = %(wid)s,
+                    lease_id         = locked._lease_id,
+                    lease_expires_at = NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second'
+                FROM locked
+                WHERE {jobs}.id = locked._id
+                RETURNING
+                """
+                + JOB_COLS
+            ).format(jobs=self._t["jobs"], order_sql=order_sql),
+            {
+                "queues": ordered_queues,
+                "limit": limit,
+                "wid": worker_id,
+                "ttl": lease_ttl,
+                "functions": functions,
+                **extra_params,
+            },
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return []
+
+        jobs = [Job.from_row(r, self._serializer) for r in rows]
+
+        for job in jobs:
+            await cur.execute(
+                SQL("DELETE FROM {wj} WHERE job_id = %(jid)s").format(wj=self._t["worker_jobs"]),
+                {"jid": job.id},
             )
-            rows = await cur.fetchall()
-            if not rows:
-                return []
+            await cur.execute(
+                SQL("""
+                    INSERT INTO {worker_jobs} (worker_id, job_id)
+                    VALUES (%(wid)s, %(jid)s)
+                """).format(worker_jobs=self._t["worker_jobs"]),
+                {"wid": worker_id, "jid": job.id},
+            )
+            await cur.execute(
+                SQL("""
+                    INSERT INTO {executions} (id, job_id, worker_id, attempt, status)
+                    VALUES (%(lease)s, %(jid)s, %(wid)s, %(attempt)s, 'running')
+                """).format(executions=self._t["executions"]),
+                {"lease": job.lease_id, "jid": job.id, "wid": worker_id, "attempt": job.attempts},
+            )
 
-            jobs = [Job.from_row(r, self._serializer) for r in rows]
-
-            for job in jobs:
-                await cur.execute(
-                    SQL("DELETE FROM {wj} WHERE job_id = %(jid)s").format(wj=self._t["worker_jobs"]),
-                    {"jid": job.id},
-                )
-                await cur.execute(
-                    SQL("""
-                        INSERT INTO {worker_jobs} (worker_id, job_id)
-                        VALUES (%(wid)s, %(jid)s)
-                    """).format(worker_jobs=self._t["worker_jobs"]),
-                    {"wid": worker_id, "jid": job.id},
-                )
-                await cur.execute(
-                    SQL("""
-                        INSERT INTO {executions} (id, job_id, worker_id, attempt, status)
-                        VALUES (%(lease)s, %(jid)s, %(wid)s, %(attempt)s, 'running')
-                    """).format(executions=self._t["executions"]),
-                    {"lease": job.lease_id, "jid": job.id, "wid": worker_id, "attempt": job.attempts},
-                )
-
-            return jobs
+        return jobs
 
     # ------------------------------------------------------------------
     # Ack / Nack / Requeue

@@ -157,7 +157,9 @@ class Werk:
         from .remote.repository import RemoteRepository
 
         if self.__remote_repo is None:
-            self.__remote_repo = RemoteRepository(self._connect, self._t, self._settlement)
+            self.__remote_repo = RemoteRepository(
+                self._connect, self._t, self._settlement, job_repo=self._job_repo, worker_repo=self._worker_repo
+            )
         return self.__remote_repo
 
     @property
@@ -1167,6 +1169,11 @@ class Werk:
         for job, settled in released:
             await self._settlement.run_callback(job, settled)
         return revoked
+
+    async def expire_idle_remote_workers(self) -> int:
+        """Stop remote workers that went quiet (no call for 2x ``remote_lease_ttl``) or
+        finished draining, as long as they hold no live lease. Runs in maintenance."""
+        return await self._remote_repo.expire_idle(self.config.remote_lease_ttl)
 
     async def revoke_worker(self, worker_id: str, drain: bool = False) -> bool:
         """Retire one remote worker; with *drain*, let it finish the jobs it holds first.

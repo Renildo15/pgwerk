@@ -15,6 +15,7 @@ def _app(**overrides):
     app.sweep = AsyncMock(return_value=["a", "b"])
     app.expire_unstarted = AsyncMock(return_value=4)
     app.purge_expired = AsyncMock(return_value=5)
+    app.expire_idle_remote_workers = AsyncMock(return_value=0)
     app.config.purge_expired = True
     app.reconcile_waiting = AsyncMock(return_value=ReconcileResult(queued=2, failed=1))
     app.reschedule_stuck = AsyncMock(return_value=3)

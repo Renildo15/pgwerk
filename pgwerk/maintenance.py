@@ -42,6 +42,8 @@ class MaintenanceReport:
     """Stranded ``waiting`` jobs that were settled."""
     expired: int = 0
     """Unstarted jobs aborted because their ``_ttl`` ran out."""
+    idle_workers: int = 0
+    """Remote workers stopped because they went idle or finished draining."""
     purged: int = 0
     """Finished jobs deleted because their retention ran out."""
     rescheduled: int = 0
@@ -86,6 +88,12 @@ class Maintenance:
             except Exception as exc:
                 report.errors["purge_expired"] = str(exc)
                 logger.warning("maintenance: purging expired rows failed: %s", exc)
+
+        try:
+            report.idle_workers = await self.app.expire_idle_remote_workers()
+        except Exception as exc:
+            report.errors["expire_idle_remote_workers"] = str(exc)
+            logger.warning("maintenance: expiring idle remote workers failed: %s", exc)
 
         try:
             report.reconciled = await self.app.reconcile_waiting()

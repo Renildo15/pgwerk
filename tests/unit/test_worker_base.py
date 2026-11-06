@@ -306,6 +306,7 @@ class TestSweepLoop:
         w.app.reschedule_stuck = AsyncMock(return_value=0)
         w.app.expire_unstarted = AsyncMock(return_value=0)
         w.app.purge_expired = AsyncMock(return_value=0)
+        w.app.expire_idle_remote_workers = AsyncMock(return_value=0)
         w.app.config.purge_expired = True
 
         async def fast_sleep(delay):

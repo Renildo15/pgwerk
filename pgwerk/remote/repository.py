@@ -5,28 +5,79 @@ No HTTP here, so the CLI and tests can use it without Litestar.
 
 from __future__ import annotations
 
+import hmac
+import json
+import uuid
+
 from typing import TYPE_CHECKING
 from typing import Any
 from datetime import datetime
+from dataclasses import dataclass
 
 from psycopg.sql import SQL
 from psycopg.rows import dict_row
 
 from . import tokens
+from .errors import Scope
+from .errors import Draining
+from .errors import LeaseLost
+from .errors import Unauthorized
+from ..schemas import JOB_COLS
+from ..schemas import Job
+from ..commons import JobStatus
+from ..commons import DequeueStrategy
+from ..settlement import Fence
+from ..settlement import Outcome
 
 
 if TYPE_CHECKING:
-    from ..schemas import Job
+    from ..repos import JobRepository
+    from ..repos import WorkerRepository
     from ..settlement import Settled
     from ..settlement import Settlement
     from ..connection import Connect
 
 
+@dataclass(frozen=True)
+class Session:
+    """An authenticated remote worker, for the duration of one call."""
+
+    worker_id: str
+    queues: list[str]
+    functions: list[str]
+    status: str
+
+
+@dataclass(frozen=True)
+class Claimed:
+    job: Job
+    lease_ttl: int
+
+
+@dataclass(frozen=True)
+class Reported:
+    """The outcome of ``complete``/``fail``. ``status`` is what the job (or, on a
+    replay, the attempt) ended as; ``settled`` holds callbacks to run after commit."""
+
+    status: str
+    retry_at: datetime | None = None
+    settled: "tuple[Job, Settled] | None" = None
+
+
 class RemoteRepository:
-    def __init__(self, connect: "Connect", tables: dict[str, Any], settlement: "Settlement") -> None:
+    def __init__(
+        self,
+        connect: "Connect",
+        tables: dict[str, Any],
+        settlement: "Settlement",
+        job_repo: "JobRepository | None" = None,
+        worker_repo: "WorkerRepository | None" = None,
+    ) -> None:
         self._connect = connect
         self._t = tables
         self._settlement = settlement
+        self._jobs = job_repo
+        self._workers = worker_repo
 
     # ------------------------------------------------------------------
     # Enrollment tokens (operator side)
@@ -145,3 +196,276 @@ class RemoteRepository:
                 return False, []
             released = await self._settlement.release_worker_jobs(cur, [worker_id], "revoked")
         return True, released
+
+    # ------------------------------------------------------------------
+    # Protocol side (worker calls)
+    # ------------------------------------------------------------------
+
+    async def register(
+        self,
+        enrollment: tokens.ParsedToken,
+        *,
+        name: str,
+        queues: list[str],
+        functions: list[str],
+        labels: dict[str, Any] | None = None,
+        client: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """Exchange an enrollment token for a new worker identity.
+
+        Returns:
+            ``(worker_id, worker_token)``. The worker token is returned only here.
+
+        Raises:
+            Unauthorized: unknown, revoked or expired enrollment token, or wrong secret.
+            Scope: *queues* not within the token's queues, or no queues/functions.
+        """
+        assert self._workers is not None
+        if enrollment.kind != "enrollment":
+            raise Unauthorized("register needs an enrollment token")
+        if not queues or not functions:
+            raise Scope("declare at least one queue and one function")
+        client = client or {}
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                SQL("""
+                    UPDATE {t} SET last_used_at = NOW()
+                    WHERE id = %(id)s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
+                    RETURNING secret_hash, queues
+                """).format(t=self._t["enrollment_tokens"]),
+                {"id": enrollment.id},
+            )
+            row = await cur.fetchone()
+            if row is None or not hmac.compare_digest(bytes(row["secret_hash"]), enrollment.secret_hash):
+                raise Unauthorized("invalid enrollment token")
+            outside = sorted(set(queues) - set(row["queues"]))
+            if outside:
+                raise Scope(f"queues not allowed by this token: {', '.join(outside)}")
+
+            worker_id = str(uuid.uuid4())
+            worker_token, session_hash = tokens.generate("worker", worker_id)
+            await cur.execute(
+                SQL("""
+                    INSERT INTO {w} (id, name, queue, status, role, metadata, heartbeat_at, functions,
+                                     session_hash, enrollment_token_id)
+                    VALUES (%(id)s, %(name)s, %(queue)s, 'active', 'remote', %(meta)s, NOW(), %(functions)s,
+                            %(hash)s, %(token_id)s)
+                """).format(w=self._t["worker"]),
+                {
+                    "id": worker_id,
+                    "name": name,
+                    "queue": ",".join(queues),
+                    "meta": json.dumps({"labels": labels or {}, "client": client, "queues": queues}),
+                    "functions": functions,
+                    "hash": session_hash,
+                    "token_id": enrollment.id,
+                },
+            )
+            await self._workers.upsert_functions(cur, functions, str(client.get("lang") or "unknown"))
+        return worker_id, worker_token
+
+    async def _authenticate(self, cur: Any, token: tokens.ParsedToken, *, claiming: bool = False) -> Session:
+        """Check a worker token and record liveness, in the caller's transaction.
+
+        It is an ``UPDATE`` on the worker row, so it also locks it: a revoke that
+        runs concurrently waits for this call's write and then sees (and releases)
+        what it did. The token is checked on every call (no cache): revocation takes
+        effect on the next one.
+        """
+        if token.kind != "worker":
+            raise Unauthorized("this endpoint needs a worker token")
+        await cur.execute(
+            SQL("""
+                UPDATE {w} w SET heartbeat_at = NOW()
+                FROM {t} t
+                WHERE w.id = %(id)s
+                  AND w.session_hash = %(hash)s
+                  AND w.role = 'remote'
+                  AND w.status IN ('active', 'draining')
+                  AND t.id = w.enrollment_token_id
+                  AND t.revoked_at IS NULL
+                RETURNING w.id::text, w.queue, w.functions, w.status
+            """).format(w=self._t["worker"], t=self._t["enrollment_tokens"]),
+            {"id": token.id, "hash": token.secret_hash},
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise Unauthorized("invalid or revoked worker token")
+        if claiming and row["status"] == "draining":
+            raise Draining("this worker is draining: finish the jobs you hold, then deregister")
+        return Session(row["id"], row["queue"].split(","), row["functions"] or [], row["status"])
+
+    async def authenticate(self, token: tokens.ParsedToken, *, claiming: bool = False) -> Session:
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            return await self._authenticate(cur, token, claiming=claiming)
+
+    async def claim(self, token: tokens.ParsedToken, claim_id: str, lease_ttl: int) -> Claimed | None:
+        """Claim one job for the worker, or ``None`` if there is nothing (or the claim id is spent).
+
+        A retried claim with the same *claim_id* (its response was lost) gets the same
+        lease back while the attempt still owns the job. Once that attempt is over
+        (settled, lost, released), the claim id is spent: ``None``, and the client
+        claims again with a fresh one.
+        """
+        assert self._jobs is not None
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            session = await self._authenticate(cur, token, claiming=True)
+            await cur.execute(
+                SQL("SELECT id::text AS lease_id, job_id::text FROM {e} WHERE claim_id = %(cid)s").format(
+                    e=self._t["executions"]
+                ),
+                {"cid": claim_id},
+            )
+            previous = await cur.fetchone()
+            if previous is not None:
+                await cur.execute(
+                    SQL(
+                        "SELECT "
+                        + JOB_COLS
+                        + """ FROM {jobs}
+                        WHERE id = %(jid)s AND lease_id = %(lease)s AND worker_id = %(wid)s
+                          AND status IN ('active', 'aborting')"""
+                    ).format(jobs=self._t["jobs"]),
+                    {"jid": previous["job_id"], "lease": previous["lease_id"], "wid": session.worker_id},
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return None
+                job = Job.from_row(row, self._jobs._serializer)
+                return Claimed(job, job.heartbeat_secs or lease_ttl)
+
+            jobs = await self._workers_dequeue(cur, session, lease_ttl)
+            if not jobs:
+                return None
+            job = jobs[0]
+            await cur.execute(
+                SQL("UPDATE {e} SET claim_id = %(cid)s WHERE id = %(lease)s").format(e=self._t["executions"]),
+                {"cid": claim_id, "lease": job.lease_id},
+            )
+            return Claimed(job, job.heartbeat_secs or lease_ttl)
+
+    async def _workers_dequeue(self, cur: Any, session: Session, lease_ttl: int) -> list[Job]:
+        assert self._workers is not None
+        return await self._workers.dequeue_in(
+            cur,
+            session.worker_id,
+            session.queues,
+            1,
+            DequeueStrategy.Priority,
+            lease_ttl=lease_ttl,
+            functions=session.functions,
+        )
+
+    async def heartbeat(
+        self, token: tokens.ParsedToken, lease_id: str, lease_ttl: int, progress: Any = None
+    ) -> tuple[datetime, bool]:
+        """Renew one lease. Returns ``(lease_expires_at, abort_requested)``.
+
+        Raises:
+            LeaseLost: the attempt no longer owns the job; the client must stop it.
+        """
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            session = await self._authenticate(cur, token)
+            await cur.execute(
+                SQL("""
+                    UPDATE {jobs}
+                    SET lease_expires_at = NOW() + COALESCE(heartbeat_secs, %(ttl)s) * INTERVAL '1 second',
+                        touched_at = NOW()
+                    WHERE lease_id = %(lease)s AND worker_id = %(wid)s AND status IN ('active', 'aborting')
+                    RETURNING status, lease_expires_at
+                """).format(jobs=self._t["jobs"]),
+                {"ttl": lease_ttl, "lease": lease_id, "wid": session.worker_id},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise LeaseLost("this attempt no longer owns the job")
+            if progress is not None:
+                await cur.execute(
+                    SQL("UPDATE {e} SET progress = %(p)s WHERE id = %(lease)s").format(e=self._t["executions"]),
+                    {"p": json.dumps(progress), "lease": lease_id},
+                )
+            return row["lease_expires_at"], row["status"] == JobStatus.Aborting.value
+
+    async def report(self, token: tokens.ParsedToken, lease_id: str, outcome: Outcome) -> Reported:
+        """Settle an attempt from ``complete``/``fail``. Idempotent per lease.
+
+        - The attempt is running and still owns the job: it settles.
+        - The attempt already settled (complete/failed/aborted): its status is
+          returned again and nothing runs twice.
+        - The attempt was lost or superseded, or belongs to another worker:
+          :class:`LeaseLost`.
+        - No execution row (the job was deleted, e.g. ``failure_mode="delete"``):
+          ``"settled"``. Ownership can't be checked then, and nothing is revealed.
+        """
+        assert self._jobs is not None
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            session = await self._authenticate(cur, token)
+            await cur.execute(
+                SQL("SELECT job_id::text, worker_id::text, status FROM {e} WHERE id = %(lease)s FOR UPDATE").format(
+                    e=self._t["executions"]
+                ),
+                {"lease": lease_id},
+            )
+            execution = await cur.fetchone()
+            if execution is None:
+                return Reported("settled")
+            if execution["worker_id"] is not None and execution["worker_id"] != session.worker_id:
+                raise LeaseLost("this attempt no longer owns the job")
+            if execution["status"] in ("complete", "failed", "aborted"):
+                return Reported(execution["status"])
+            if execution["status"] != "running":
+                raise LeaseLost("this attempt no longer owns the job")
+
+            await cur.execute(
+                SQL("SELECT " + JOB_COLS + " FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
+                {"id": execution["job_id"]},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return Reported("settled")
+            job = Job.from_row(row, self._jobs._serializer)
+            fence = Fence(job.id, worker_id=session.worker_id, attempt=job.attempts, lease_id=lease_id)
+            settled = await self._settlement.apply(cur, job, fence, outcome)
+            if settled.status is None:
+                raise LeaseLost("this attempt no longer owns the job")
+            return Reported(settled.status.value, settled.retry_at, (job, settled))
+
+    async def deregister(self, token: tokens.ParsedToken) -> list[tuple[Job, "Settled"]]:
+        """Stop the worker; jobs it still holds go back to the queue (not counted as lost)."""
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            session = await self._authenticate(cur, token)
+            released = await self._settlement.release_worker_jobs(cur, [session.worker_id], "deregistered")
+            await cur.execute(
+                SQL("""
+                    UPDATE {w} SET status = 'stopped', session_hash = NULL, expires_at = NOW() + INTERVAL '1 hour'
+                    WHERE id = %(id)s
+                """).format(w=self._t["worker"]),
+                {"id": session.worker_id},
+            )
+            return released
+
+    async def expire_idle(self, lease_ttl: int) -> int:
+        """Stop remote workers that hold no live lease and are idle or draining.
+
+        Idle means no call for ``2 × lease_ttl``. A draining worker stops as soon as
+        it holds no live lease. Their tokens stop working.
+        """
+        async with await self._connect() as conn, conn.cursor() as cur:
+            await cur.execute(
+                SQL("""
+                    UPDATE {w} w
+                    SET status = 'stopped', session_hash = NULL, expires_at = NOW() + INTERVAL '1 hour'
+                    WHERE w.role = 'remote'
+                      AND w.status IN ('active', 'draining')
+                      AND (w.status = 'draining'
+                           OR w.heartbeat_at < NOW() - 2 * %(ttl)s * INTERVAL '1 second')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {jobs} j
+                          WHERE j.worker_id = w.id
+                            AND j.status IN ('active', 'aborting')
+                            AND j.lease_expires_at > NOW()
+                      )
+                """).format(w=self._t["worker"], jobs=self._t["jobs"]),
+                {"ttl": lease_ttl},
+            )
+            return cur.rowcount
