@@ -55,7 +55,7 @@ def create_app(config: WerkConfig | None = None) -> Litestar:
         from ..remote.server import init_remote
         from ..remote.server import make_remote_router
 
-        route_handlers.append(make_remote_router(state))
+        route_handlers.append(make_remote_router(state, config))
         init_remote(config, state, on_startup, on_shutdown)
 
     if config.maintenance_enabled:

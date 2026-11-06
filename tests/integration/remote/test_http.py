@@ -99,7 +99,7 @@ class TestAuth:
 
     async def test_scope_and_revocation(self, app, client):
         enrollment, row = await app.create_enrollment_token("box", ["default"])
-        body = {"queues": ["default", "secret"], "functions": [NOOP]}
+        body = {"queues": ["default", "secret"], "functions": [{"name": NOOP}]}
         resp = await client.post("/remote/v1/register", headers=_h(enrollment), json=body)
         assert (resp.status_code, resp.json()["error"]["code"]) == (403, "scope")
         await app.revoke_enrollment_token(row["id"])
@@ -260,3 +260,42 @@ class TestDrainAndRateLimit:
             assert (await _claim(c, reg["worker_token"])).status_code == 204
             resp = await _claim(c, reg["worker_token"])
             assert (resp.status_code, resp.json()["error"]["code"]) == (429, "rate_limited")
+
+
+class TestProtocolShape:
+    async def test_invalid_body_is_bad_request_in_the_protocol_error_shape(self, app, client):
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        resp = await client.post("/remote/v1/register", headers=_h(enrollment), json={"queues": "default"})
+        assert resp.status_code == 400
+        assert set(resp.json()) == {"error"} and resp.json()["error"]["code"] == "bad_request"
+
+    async def test_oversized_request_body_is_too_large_before_parsing(self, app, client):
+        reg = await _register(app, client)
+        resp = await client.post(
+            "/remote/v1/claim",
+            headers=_h(reg["worker_token"]),
+            content=b'{"claim_id": "' + b"x" * (300 * 1024) + b'"}',
+        )
+        assert (resp.status_code, resp.json()["error"]["code"]) == (413, "too_large")
+
+    async def test_unknown_request_fields_are_ignored(self, app, client):
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        resp = await client.post(
+            "/remote/v1/register",
+            headers=_h(enrollment),
+            json={"queues": ["default"], "functions": [{"name": NOOP, "future": 1}], "future_field": True},
+        )
+        assert resp.status_code == 201
+
+    async def test_every_error_code_is_in_the_frozen_list(self, app, client):
+        from pgwerk.remote.errors import ErrorCode
+
+        reg = await _register(app, client)
+        seen = set()
+        for resp in (
+            await client.post("/remote/v1/claim", json={}),  # no protocol header
+            await _claim(client, "nope"),
+            await client.post("/remote/v1/claim", headers=_h(reg["worker_token"]), json={"claim_id": "x"}),
+        ):
+            seen.add(resp.json()["error"]["code"])
+        assert seen <= {c.value for c in ErrorCode}

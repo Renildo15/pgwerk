@@ -1,4 +1,7 @@
-"""Request size limits and the per-worker claim rate limiter."""
+"""Error truncation and the per-worker claim rate limiter.
+
+Body size limits are enforced by Litestar (``request_max_body_size`` per route) before the
+body is parsed."""
 
 from __future__ import annotations
 
@@ -8,29 +11,6 @@ import time
 
 from typing import Any
 from collections import OrderedDict
-
-from litestar import Request
-
-from ..errors import TooLarge
-
-
-async def read_body(request: Request, limit: int) -> bytes:
-    """Read the request body, refusing it (413) past *limit* bytes.
-
-    ``Content-Length`` is checked before anything is read, and a chunked body is cut
-    off as soon as it passes the limit, so an oversized body is never buffered whole.
-    """
-    declared = request.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > limit:
-        raise TooLarge(f"body over {limit} bytes")
-    chunks: list[bytes] = []
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > limit:
-            raise TooLarge(f"body over {limit} bytes")
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 MAX_ERROR_TYPE = 256

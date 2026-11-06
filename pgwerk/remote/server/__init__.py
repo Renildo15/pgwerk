@@ -1,10 +1,11 @@
-"""The ``/remote/v1`` router: the HTTP side of the remote-worker protocol (experimental).
+"""The ``/remote/v1`` router: the HTTP side of the remote-worker protocol.
 
 Mounted by :func:`pgwerk.api.app.create_app` when ``WerkConfig.remote_workers`` is on.
-Every endpoint is an RPC-style ``POST``. It requires ``Pgwerk-Protocol: 1`` and a
+Every endpoint is an RPC-style ``POST`` that requires ``Pgwerk-Protocol: 1`` and a
 bearer token: the enrollment token for ``register``, and the worker token it returns
-for everything else. Errors are ``{"error": {"code", "message"}}``; clients branch on
-``code``, never on ``message``.
+for everything else. Errors are ``{"error": {"code", "message"}}``. Clients branch on
+``code``, never on ``message``. The normative description is
+``docs/reference/remote-protocol.md``.
 """
 
 from __future__ import annotations
@@ -25,15 +26,24 @@ from litestar import Request
 from litestar import Response
 from litestar import post
 from litestar.di import Provide
+from litestar.openapi import ResponseSpec
 from litestar.exceptions import HTTPException
+from litestar.exceptions import ValidationException
 
 from .. import tokens
-from ..errors import Scope
-from ..errors import TooLarge
-from ..errors import RemoteError
-from ..errors import RateLimited
-from ..errors import Unauthorized
-from ..errors import ProtocolMismatch
+from .models import JobBody
+from .models import Limits
+from .models import ErrorBody
+from .models import FailRequest
+from .models import ClaimRequest
+from .models import ErrorResponse
+from .models import ClaimResponse
+from .models import ReportResponse
+from .models import CompleteRequest
+from .models import RegisterRequest
+from .models import HeartbeatRequest
+from .models import RegisterResponse
+from .models import HeartbeatResponse
 from .limits import MAX_NAME
 from .limits import MAX_QUEUES
 from .limits import MAX_FUNCTIONS
@@ -42,10 +52,16 @@ from .limits import MAX_CLIENT_FIELD
 from .limits import MAX_LABELS_BYTES
 from .limits import MAX_PROGRESS_BYTES
 from .limits import TokenBucket
-from .limits import read_body
 from .limits import clean_text
 from .limits import error_json
 from .limits import truncate_error
+from ..errors import Scope
+from ..errors import TooLarge
+from ..errors import ErrorCode
+from ..errors import RemoteError
+from ..errors import RateLimited
+from ..errors import Unauthorized
+from ..errors import ProtocolMismatch
 from .longpoll import Waiters
 from ..repository import ClaimSpent
 from ...settlement import Outcome
@@ -124,21 +140,6 @@ def _token(request: Request, kind: tokens.TokenKind) -> tokens.ParsedToken:
     return token
 
 
-async def _json(request: Request, limit: int) -> dict[str, Any]:
-    body = await read_body(request, limit)
-    if not body:
-        return {}
-    try:
-        data = json.loads(body)
-    except ValueError:
-        raise RemoteError("body is not valid JSON") from None
-    except RecursionError:
-        raise RemoteError("body is nested too deeply") from None
-    if not isinstance(data, dict):
-        raise RemoteError("body must be a JSON object")
-    return data
-
-
 def _uuid(value: Any, field: str) -> str:
     try:
         return str(uuid.UUID(str(value)))
@@ -146,38 +147,40 @@ def _uuid(value: Any, field: str) -> str:
         raise RemoteError(f"{field} must be a UUID") from None
 
 
-def _str_list(value: Any, field: str, max_items: int) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
-        raise RemoteError(f"{field} must be a list of non-empty strings")
-    if len(value) > max_items:
+def _bounded(values: list[str], field: str, max_items: int) -> list[str]:
+    if len(values) > max_items:
         raise RemoteError(f"{field}: at most {max_items} entries")
-    if any(len(v) > MAX_IDENTIFIER for v in value):
+    if any(len(v) > MAX_IDENTIFIER for v in values):
         raise RemoteError(f"{field}: each entry at most {MAX_IDENTIFIER} characters")
-    return value
+    return values
 
 
-def _job_body(job: "Job") -> dict[str, Any]:
+def _job_body(job: "Job") -> JobBody:
     payload = job.payload or {}
-    return {
-        "id": job.id,
-        "function": job.function,
-        "queue": job.queue,
-        "kwargs": payload.get("kwargs") or {},
-        "args": payload.get("args") or [],
-        "attempts": job.attempts,
-        "max_attempts": job.max_attempts,
-        "lost_count": job.lost_count,
-        "timeout_secs": job.timeout_secs,
-        "meta": job.meta,
-    }
+    return JobBody(
+        id=job.id,
+        function=job.function,
+        queue=job.queue,
+        kwargs=payload.get("kwargs") or {},
+        args=payload.get("args") or [],
+        attempts=job.attempts,
+        max_attempts=job.max_attempts,
+        lost_count=job.lost_count,
+        timeout_secs=job.timeout_secs,
+        meta=job.meta,
+    )
 
 
-def _protocol_error(status: int, code: str, message: str) -> Response:
-    return Response(content={"error": {"code": code, "message": message}}, status_code=status)
+def _error(status: int, code: ErrorCode, message: str) -> Response:
+    return Response(content=ErrorResponse(ErrorBody(code.value, message)), status_code=status)
 
 
-def _error_response(_: Request, exc: RemoteError) -> Response:
-    return _protocol_error(exc.status_code, exc.code, exc.message)
+def _remote_error(_: Request, exc: RemoteError) -> Response:
+    return _error(exc.status_code, exc.code, exc.message)
+
+
+def _validation_error(_: Request, exc: ValidationException) -> Response:
+    return _error(400, ErrorCode.BAD_REQUEST, str(exc.detail))
 
 
 def _unexpected_error(request: Request, exc: Exception) -> Response:
@@ -187,207 +190,260 @@ def _unexpected_error(request: Request, exc: Exception) -> Response:
     request; data Postgres can't store (NUL characters) and over-deep JSON are the
     client's 400, so it doesn't retry a request that can never succeed.
     """
-    if isinstance(exc, HTTPException):
-        if exc.status_code == 413:
-            return _protocol_error(413, "too_large", "request body too large")
-        if exc.status_code == 404:
-            return _protocol_error(404, "not_found", str(exc.detail))
-        if exc.status_code < 500:
-            return _protocol_error(exc.status_code, "bad_request", str(exc.detail))
-        return _protocol_error(exc.status_code, "internal", "internal error")
     if isinstance(exc, RecursionError):
-        return _protocol_error(400, "bad_request", "body is nested too deeply")
+        return _error(400, ErrorCode.BAD_REQUEST, "body is nested too deeply")
     if isinstance(exc, psycopg.DataError):
-        return _protocol_error(400, "bad_request", f"the request holds data the server can't store: {exc}")
+        return _error(400, ErrorCode.BAD_REQUEST, f"the request holds data the server can't store: {exc}")
     if isinstance(exc, psycopg.OperationalError):
         logger.warning("remote: database unavailable on %s: %s", request.url.path, exc)
-        return _protocol_error(503, "internal", "database unavailable; retry")
+        return _error(503, ErrorCode.INTERNAL, "database unavailable; retry")
     logger.exception("remote: unexpected error on %s", request.url.path, exc_info=exc)
-    return _protocol_error(500, "internal", "internal error")
+    return _error(500, ErrorCode.INTERNAL, "internal error")
+
+
+def _http_error(_: Request, exc: HTTPException) -> Response:
+    if exc.status_code == 413:
+        return _error(413, ErrorCode.TOO_LARGE, "request body too large")
+    if exc.status_code == 404:
+        return _error(404, ErrorCode.NOT_FOUND, str(exc.detail))
+    if exc.status_code < 500:
+        return _error(exc.status_code, ErrorCode.BAD_REQUEST, str(exc.detail))
+    return _error(exc.status_code, ErrorCode.INTERNAL, "internal error")
+
+
+_ERRORS = {
+    400: ResponseSpec(ErrorResponse, description="bad_request or protocol"),
+    401: ResponseSpec(
+        ErrorResponse,
+        description="unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again",
+    ),
+    413: ResponseSpec(ErrorResponse, description="too_large"),
+}
 
 
 # --- endpoints ---------------------------------------------------------------
 
 
-@post("/register", status_code=201)
-async def register(request: Request, remote: RemoteServer) -> dict[str, Any]:
-    cfg = remote.config
-    token = _token(request, "enrollment")
-    body = await _json(request, cfg.remote_max_payload_bytes)
-    functions = [f["name"] if isinstance(f, dict) else f for f in body.get("functions") or []]
-    queues = _str_list(body.get("queues"), "queues", MAX_QUEUES)
-    functions = _str_list(functions, "functions", MAX_FUNCTIONS)
-    if not queues or not functions:
-        raise Scope("declare at least one queue and one function")
-    raw_client = body.get("client") if isinstance(body.get("client"), dict) else {}
-    client = {k: clean_text(raw_client[k], MAX_CLIENT_FIELD) for k in ("lang", "version") if k in raw_client}
-    labels = body.get("labels") if isinstance(body.get("labels"), dict) else {}
-    if len(json.dumps(labels).encode()) > MAX_LABELS_BYTES:
-        raise RemoteError(f"labels: at most {MAX_LABELS_BYTES} bytes of JSON")
+def _handlers(config: "WerkConfig") -> list:
+    payload_limit = config.remote_max_payload_bytes
+    result_limit = config.remote_max_result_bytes + 1024  # room for the envelope
 
-    def admit() -> None:
-        # Called once the token's secret checked out, so a stranger who only knows the
-        # token id can't use up its registrations.
-        if not remote.register_bucket.allow(token.id):
-            raise RateLimited("too many registrations with this token; slow down")
-
-    worker_id, worker_token = await remote.repo.register(
-        token,
-        name=clean_text(body.get("name") or "remote", MAX_NAME) or "remote",
-        queues=queues,
-        functions=functions,
-        labels=labels,
-        client=client,
-        admit=admit,
-        max_workers=cfg.remote_max_workers_per_token,
+    @post(
+        "/register",
+        status_code=201,
+        request_max_body_size=payload_limit,
+        responses={**_ERRORS, 403: ResponseSpec(ErrorResponse, description="scope")},
+        summary="Exchange an enrollment token for a worker identity",
     )
-    return {
-        "worker_id": worker_id,
-        "worker_token": worker_token,
-        "protocol": int(PROTOCOL),
-        "lease_ttl": cfg.remote_lease_ttl,
-        "claim_wait": cfg.remote_claim_wait,
-        "limits": {
-            "max_payload_bytes": cfg.remote_max_payload_bytes,
-            "max_result_bytes": cfg.remote_max_result_bytes,
-            "max_error_bytes": cfg.remote_max_error_bytes,
+    async def register(request: Request, data: RegisterRequest, remote: RemoteServer) -> RegisterResponse:
+        token = _token(request, "enrollment")
+        cfg = remote.config
+        functions = [f.name for f in data.functions]
+        if not data.queues or not functions or not all(data.queues) or not all(functions):
+            raise Scope("declare at least one queue and one function")
+        queues = _bounded(data.queues, "queues", MAX_QUEUES)
+        functions = _bounded(functions, "functions", MAX_FUNCTIONS)
+        labels = data.labels or {}
+        if len(json.dumps(labels).encode()) > MAX_LABELS_BYTES:
+            raise RemoteError(f"labels: at most {MAX_LABELS_BYTES} bytes of JSON")
+
+        def admit() -> None:
+            # Called once the token's secret checked out, so a stranger who only knows
+            # the token id can't use up its registrations.
+            if not remote.register_bucket.allow(token.id):
+                raise RateLimited("too many registrations with this token; slow down")
+
+        worker_id, worker_token = await remote.repo.register(
+            token,
+            name=clean_text(data.name or "remote", MAX_NAME) or "remote",
+            queues=queues,
+            functions=functions,
+            labels=labels,
+            client={
+                "lang": clean_text(data.client.lang, MAX_CLIENT_FIELD),
+                "version": clean_text(data.client.version, MAX_CLIENT_FIELD),
+            },
+            admit=admit,
+            max_workers=cfg.remote_max_workers_per_token,
+        )
+        return RegisterResponse(
+            worker_id=worker_id,
+            worker_token=worker_token,
+            protocol=int(PROTOCOL),
+            lease_ttl=cfg.remote_lease_ttl,
+            claim_wait=cfg.remote_claim_wait,
+            limits=Limits(cfg.remote_max_payload_bytes, cfg.remote_max_result_bytes, cfg.remote_max_error_bytes),
+        )
+
+    @post(
+        "/deregister",
+        status_code=204,
+        request_max_body_size=payload_limit,
+        responses=_ERRORS,
+        summary="Stop this worker; jobs it holds go back to the queue",
+    )
+    async def deregister(request: Request, remote: RemoteServer) -> None:
+        token = _token(request, "worker")
+        remote.run_callbacks(await remote.repo.deregister(token))
+
+    @post(
+        "/claim",
+        request_max_body_size=payload_limit,
+        responses={
+            **_ERRORS,
+            200: ResponseSpec(ClaimResponse, description="a job, leased to this worker"),
+            204: ResponseSpec(None, description="nothing to claim within the wait, or a spent claim_id"),
+            403: ResponseSpec(ErrorResponse, description="draining"),
+            429: ResponseSpec(ErrorResponse, description="rate_limited"),
         },
-    }
-
-
-@post("/deregister", status_code=204)
-async def deregister(request: Request, remote: RemoteServer) -> None:
-    token = _token(request, "worker")
-    remote.run_callbacks(await remote.repo.deregister(token))
-
-
-@post("/claim")
-async def claim(request: Request, remote: RemoteServer) -> Response:
-    cfg = remote.config
-    token = _token(request, "worker")
-    body = await _json(request, cfg.remote_max_payload_bytes)
-    claim_id = _uuid(body.get("claim_id"), "claim_id")
-    wait = body.get("wait", cfg.remote_claim_wait)
-    wait = max(
-        0.0, min(float(wait) if isinstance(wait, (int, float)) else cfg.remote_claim_wait, cfg.remote_claim_wait)
+        summary="Long-poll for one job",
     )
-    session = await remote.repo.authenticate(token, claiming=True)
-    # Limits are keyed on the authenticated worker: keyed on the token's id alone, a
-    # stranger who knows it could drain this worker's bucket with bogus secrets.
-    if not remote.bucket.allow(session.worker_id):
-        raise RateLimited("too many claims; slow down")
-    if remote._open_claims.get(session.worker_id, 0) >= cfg.remote_max_claims_per_worker:
-        raise RateLimited(f"at most {cfg.remote_max_claims_per_worker} open claims per worker")
-    remote._open_claims[session.worker_id] = remote._open_claims.get(session.worker_id, 0) + 1
-    try:
-        return await _long_poll(remote, token, session, claim_id, wait)
-    finally:
-        left = remote._open_claims.pop(session.worker_id, 1) - 1
-        if left > 0:
-            remote._open_claims[session.worker_id] = left
+    async def claim(request: Request, data: ClaimRequest, remote: RemoteServer) -> Response:
+        cfg = remote.config
+        token = _token(request, "worker")
+        claim_id = _uuid(data.claim_id, "claim_id")
+        wait = cfg.remote_claim_wait if data.wait is None else max(0.0, min(data.wait, cfg.remote_claim_wait))
+        session = await remote.repo.authenticate(token, claiming=True)
+        # Limits are keyed on the authenticated worker: keyed on the token's id alone, a
+        # stranger who knows it could drain this worker's bucket with bogus secrets.
+        if not remote.bucket.allow(session.worker_id):
+            raise RateLimited("too many claims; slow down")
+        if remote._open_claims.get(session.worker_id, 0) >= cfg.remote_max_claims_per_worker:
+            raise RateLimited(f"at most {cfg.remote_max_claims_per_worker} open claims per worker")
+        remote._open_claims[session.worker_id] = remote._open_claims.get(session.worker_id, 0) + 1
+        try:
+            return await _long_poll(remote, token, session, claim_id, wait)
+        finally:
+            left = remote._open_claims.pop(session.worker_id, 1) - 1
+            if left > 0:
+                remote._open_claims[session.worker_id] = left
 
+    async def _long_poll(remote: RemoteServer, token: Any, session: Any, claim_id: str, wait: float) -> Response:
+        cfg = remote.config
+        deadline = time.monotonic() + wait
+        async with remote.waiters.subscribe(session.queues, session.functions) as woken:
+            while True:
+                woken.clear()
+                try:
+                    claimed = await remote.repo.claim(token, claim_id, cfg.remote_lease_ttl)
+                except ClaimSpent:
+                    return Response(content=None, status_code=204)
+                if claimed is not None:
+                    job = claimed.job
+                    # There may be more work: let the next waiting worker of this group try.
+                    remote.waiters.chain(job.queue, session.functions)
+                    body = ClaimResponse(
+                        job=_job_body(job),
+                        lease_id=job.lease_id or "",
+                        lease_expires_at=job.lease_expires_at.isoformat() if job.lease_expires_at else None,
+                        lease_ttl=claimed.lease_ttl,
+                        heartbeat_every=max(1, claimed.lease_ttl // 4),
+                    )
+                    return Response(content=body, status_code=200)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return Response(content=None, status_code=204)
+                try:
+                    await asyncio.wait_for(woken.wait(), remaining)
+                except asyncio.TimeoutError:
+                    return Response(content=None, status_code=204)
 
-async def _long_poll(remote: RemoteServer, token: Any, session: Any, claim_id: str, wait: float) -> Response:
-    cfg = remote.config
-    deadline = time.monotonic() + wait
-    async with remote.waiters.subscribe(session.queues, session.functions) as woken:
-        while True:
-            woken.clear()
-            try:
-                claimed = await remote.repo.claim(token, claim_id, cfg.remote_lease_ttl)
-            except ClaimSpent:
-                return Response(content=None, status_code=204)
-            if claimed is not None:
-                job = claimed.job
-                # There may be more work: let the next waiting worker of this group try.
-                remote.waiters.chain(job.queue, session.functions)
-                return Response(
-                    content={
-                        "job": _job_body(job),
-                        "lease_id": job.lease_id,
-                        "lease_expires_at": job.lease_expires_at.isoformat() if job.lease_expires_at else None,
-                        "lease_ttl": claimed.lease_ttl,
-                        "heartbeat_every": max(1, claimed.lease_ttl // 4),
-                    },
-                    status_code=200,
+    @post(
+        "/leases/{lease_id:str}/heartbeat",
+        status_code=200,
+        request_max_body_size=payload_limit,
+        responses={**_ERRORS, 409: ResponseSpec(ErrorResponse, description="lease_lost: stop the job")},
+        summary="Renew a lease; learn whether the job was aborted",
+    )
+    async def heartbeat(
+        request: Request, lease_id: str, remote: RemoteServer, data: HeartbeatRequest | None = None
+    ) -> HeartbeatResponse:
+        token = _token(request, "worker")
+        progress = data.progress if data else None
+        if progress is not None:
+            dumped = json.dumps(progress)
+            if len(dumped.encode()) > MAX_PROGRESS_BYTES or "\\u0000" in dumped:
+                # Renew the lease anyway: failing the heartbeat would lose a healthy job.
+                logger.info(
+                    "remote: progress dropped for lease %s (over %d bytes or NUL)", lease_id, MAX_PROGRESS_BYTES
                 )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return Response(content=None, status_code=204)
-            try:
-                await asyncio.wait_for(woken.wait(), remaining)
-            except asyncio.TimeoutError:
-                return Response(content=None, status_code=204)
+                progress = None
+        expires_at, abort = await remote.repo.heartbeat(
+            token, _uuid(lease_id, "lease_id"), remote.config.remote_lease_ttl, progress=progress
+        )
+        return HeartbeatResponse(lease_expires_at=expires_at.isoformat(), abort=abort)
 
-
-@post("/leases/{lease_id:str}/heartbeat", status_code=200)
-async def heartbeat(request: Request, remote: RemoteServer, lease_id: str) -> dict[str, Any]:
-    cfg = remote.config
-    token = _token(request, "worker")
-    body = await _json(request, cfg.remote_max_payload_bytes)
-    progress = body.get("progress")
-    if progress is not None:
-        dumped = json.dumps(progress)
-        if len(dumped.encode()) > MAX_PROGRESS_BYTES or "\\u0000" in dumped:
-            # Renew the lease anyway: failing the heartbeat would lose a healthy job.
-            logger.info("remote: progress dropped for lease %s (over %d bytes or NUL)", lease_id, MAX_PROGRESS_BYTES)
-            progress = None
-    expires_at, abort = await remote.repo.heartbeat(
-        token, _uuid(lease_id, "lease_id"), cfg.remote_lease_ttl, progress=progress
+    @post(
+        "/leases/{lease_id:str}/complete",
+        status_code=200,
+        request_max_body_size=result_limit,
+        responses={**_ERRORS, 409: ResponseSpec(ErrorResponse, description="lease_lost: drop the result")},
+        summary="Report success (idempotent per lease)",
     )
-    return {"lease_expires_at": expires_at.isoformat(), "abort": abort}
+    async def complete(
+        request: Request, lease_id: str, remote: RemoteServer, data: CompleteRequest | None = None
+    ) -> ReportResponse:
+        token = _token(request, "worker")
+        result = data.result if data else None
+        if len(json.dumps(result).encode()) > remote.config.remote_max_result_bytes:
+            raise TooLarge(
+                f"result over {remote.config.remote_max_result_bytes} bytes; report it as a non-retryable failure"
+            )
+        # Stored in an envelope that decode() returns as is: a result from an untrusted
+        # worker must never reach the app's serializer in any process that reads the job.
+        outcome = Outcome("complete", encode_plain(result))
+        reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
+        if reported.settled:
+            remote.run_callbacks([reported.settled])
+        return ReportResponse(status=reported.status)
+
+    @post(
+        "/leases/{lease_id:str}/fail",
+        status_code=200,
+        request_max_body_size=payload_limit,
+        responses={**_ERRORS, 409: ResponseSpec(ErrorResponse, description="lease_lost: drop the result")},
+        summary="Report failure or abort (idempotent per lease)",
+    )
+    async def fail(request: Request, lease_id: str, data: FailRequest, remote: RemoteServer) -> ReportResponse:
+        token = _token(request, "worker")
+        if data.aborted:
+            outcome = Outcome("abort")
+        else:
+            if data.error is None:
+                raise RemoteError('error is required unless aborted: {"type": ..., "message": ..., "stack": ...}')
+            error: dict[str, Any] = {"type": data.error.type, "message": data.error.message}
+            if data.error.stack is not None:
+                error["stack"] = data.error.stack
+            error = truncate_error(error, remote.config.remote_max_error_bytes)
+            outcome = Outcome("fail", error=error_json(error), retryable=data.retryable)
+        reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
+        if reported.settled:
+            remote.run_callbacks([reported.settled])
+        return ReportResponse(
+            status=reported.status, retry_at=reported.retry_at.isoformat() if reported.retry_at else None
+        )
+
+    return [register, deregister, claim, heartbeat, complete, fail]
 
 
-@post("/leases/{lease_id:str}/complete", status_code=200)
-async def complete(request: Request, remote: RemoteServer, lease_id: str) -> dict[str, Any]:
-    cfg = remote.config
-    token = _token(request, "worker")
-    body = await _json(request, cfg.remote_max_result_bytes + 1024)
-    result = body.get("result")
-    if len(json.dumps(result).encode()) > cfg.remote_max_result_bytes:
-        raise TooLarge(f"result over {cfg.remote_max_result_bytes} bytes; report it as a non-retryable failure")
-    # Stored in an envelope that decode() returns as is: a result from an untrusted
-    # worker must never reach the app's serializer in any process that reads the job.
-    outcome = Outcome("complete", encode_plain(result))
-    reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
-    if reported.settled:
-        remote.run_callbacks([reported.settled])
-    return {"status": reported.status}
-
-
-@post("/leases/{lease_id:str}/fail", status_code=200)
-async def fail(request: Request, remote: RemoteServer, lease_id: str) -> dict[str, Any]:
-    cfg = remote.config
-    token = _token(request, "worker")
-    body = await _json(request, cfg.remote_max_payload_bytes)
-    if body.get("aborted"):
-        outcome = Outcome("abort")
-    else:
-        error = body.get("error")
-        if not isinstance(error, dict) or not isinstance(error.get("type"), str):
-            raise RemoteError('error must be an object like {"type": ..., "message": ..., "stack": ...}')
-        error = truncate_error(error, cfg.remote_max_error_bytes)
-        outcome = Outcome("fail", error=error_json(error), retryable=body.get("retryable", True) is not False)
-    reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
-    if reported.settled:
-        remote.run_callbacks([reported.settled])
-    response: dict[str, Any] = {"status": reported.status}
-    if reported.retry_at is not None:
-        response["retry_at"] = reported.retry_at.isoformat()
-    return response
-
-
-def make_remote_router(state: dict[str, Any]) -> Router:
+def make_remote_router(state: dict[str, Any], config: "WerkConfig") -> Router:
     """The ``/remote/v1`` router. *state* holds the :class:`RemoteServer` under ``"remote"``."""
 
     def _remote() -> RemoteServer:
-        return state["remote"]
+        remote: RemoteServer = state["remote"]
+        return remote
 
     return Router(
         path="/remote/v1",
-        route_handlers=[register, deregister, claim, heartbeat, complete, fail],
+        route_handlers=_handlers(config),
         dependencies={"remote": Provide(_remote, sync_to_thread=False)},
-        exception_handlers={RemoteError: _error_response, Exception: _unexpected_error},
+        exception_handlers={
+            RemoteError: _remote_error,
+            ValidationException: _validation_error,
+            HTTPException: _http_error,
+            Exception: _unexpected_error,
+        },
+        tags=["remote workers v1"],
     )
 
 
