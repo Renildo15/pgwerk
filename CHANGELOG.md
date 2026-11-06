@@ -9,6 +9,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `Werk.reconcile_waiting()`: `waiting` jobs whose dependencies have all settled are queued, or failed with `dependency failed` when a required dependency failed (cascading to their own dependents). Previously such jobs stayed in `waiting` forever.
+
 ### Fixed
 
 - The sweep no longer undoes aborts. A stuck `aborting` job now ends `aborted` (running `on_stopped`, settling dependents, honoring `failure_mode="delete"` and `failure_ttl`) instead of being requeued and run again. At the attempt cap it previously ended `failed`; it now ends `aborted`.

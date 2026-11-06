@@ -50,6 +50,16 @@ class SweepResult:
     ``failure_mode=delete``. The caller runs their ``on_stopped`` callbacks."""
 
 
+@dataclasses.dataclass
+class ReconcileResult:
+    """Outcome of :meth:`JobRepository.reconcile_waiting`."""
+
+    queued: int
+    """Stranded ``waiting`` jobs moved to ``queued``."""
+    failed: int
+    """Stranded ``waiting`` jobs failed because a required dependency failed."""
+
+
 class JobRepository:
 
     _INSERT_COLS: list[str] = [f.name for f in dataclasses.fields(JobInsert) if f.name != "dep_ids"]
@@ -781,50 +791,113 @@ class JobRepository:
                 if not candidate_ids:
                     continue
 
-                await cur.execute(
-                    SQL("""
-                        WITH settled AS (
-                            SELECT j.id,
-                                   j.queue,
-                                   EXISTS(
-                                       SELECT 1
-                                       FROM {deps} d3
-                                       JOIN {jobs} jd3 ON jd3.id = d3.depends_on
-                                       WHERE d3.job_id = j.id
-                                         AND jd3.status IN ('failed', 'aborted')
-                                         AND NOT d3.allow_failure
-                                   ) AS must_fail
-                            FROM {jobs} j
-                            WHERE j.id = ANY(%(candidate_ids)s::uuid[])
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM {deps} d2
-                                  JOIN {jobs} jd ON jd.id = d2.depends_on
-                                  WHERE d2.job_id = j.id
-                                    AND jd.status NOT IN ('complete', 'failed', 'aborted')
-                              )
-                        )
-                        UPDATE {jobs} j
-                        SET status       = CASE WHEN s.must_fail THEN 'failed'  ELSE 'queued'  END,
-                            error        = CASE WHEN s.must_fail THEN 'dependency failed' ELSE NULL END,
-                            completed_at = CASE WHEN s.must_fail THEN NOW()     ELSE NULL       END,
-                            scheduled_at = CASE WHEN s.must_fail THEN j.scheduled_at ELSE NOW() END
-                        FROM settled s
-                        WHERE j.id = s.id
-                        RETURNING j.id::text, j.queue, j.status
-                    """).format(deps=self._t["deps"], jobs=self._t["jobs"]),
-                    {"candidate_ids": candidate_ids},
-                )
-                rows = await cur.fetchall()
-                for r in rows:
-                    row_id = r["id"] if isinstance(r, dict) else r[0]
-                    row_queue = r["queue"] if isinstance(r, dict) else r[1]
-                    row_status = r["status"] if isinstance(r, dict) else r[2]
-                    if row_status == "failed":
-                        pending.append(row_id)
-                    else:
-                        notify_queues.add(row_queue)
+                failed_ids, queues = await self._settle_candidates(cur, candidate_ids)
+                pending.extend(failed_ids)
+                notify_queues.update(queues)
         return list(notify_queues)
+
+    async def _settle_candidates(self, cur: Any, candidate_ids: list[str]) -> tuple[list[str], set[str]]:
+        """Move ``waiting`` candidates whose dependencies have all settled out of ``waiting``.
+
+        A candidate with a failed or aborted dependency that doesn't allow failure ends
+        ``failed`` with ``error = 'dependency failed'``; any other settled candidate is
+        queued. A candidate with no dependency rows counts as settled and is queued.
+        Candidates with an unsettled dependency are left alone.
+
+        Returns:
+            The IDs that failed (their own dependents still need settling) and the
+            queues that received newly queued jobs.
+        """
+        await cur.execute(
+            SQL("""
+                WITH settled AS (
+                    SELECT j.id,
+                           j.queue,
+                           EXISTS(
+                               SELECT 1
+                               FROM {deps} d3
+                               JOIN {jobs} jd3 ON jd3.id = d3.depends_on
+                               WHERE d3.job_id = j.id
+                                 AND jd3.status IN ('failed', 'aborted')
+                                 AND NOT d3.allow_failure
+                           ) AS must_fail
+                    FROM {jobs} j
+                    WHERE j.id = ANY(%(candidate_ids)s::uuid[])
+                      AND j.status = 'waiting'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {deps} d2
+                          JOIN {jobs} jd ON jd.id = d2.depends_on
+                          WHERE d2.job_id = j.id
+                            AND jd.status NOT IN ('complete', 'failed', 'aborted')
+                      )
+                )
+                UPDATE {jobs} j
+                SET status       = CASE WHEN s.must_fail THEN 'failed'  ELSE 'queued'  END,
+                    error        = CASE WHEN s.must_fail THEN 'dependency failed' ELSE NULL END,
+                    completed_at = CASE WHEN s.must_fail THEN NOW()     ELSE NULL       END,
+                    scheduled_at = CASE WHEN s.must_fail THEN j.scheduled_at ELSE NOW() END
+                FROM settled s
+                WHERE j.id = s.id
+                RETURNING j.id::text, j.queue, j.status
+            """).format(deps=self._t["deps"], jobs=self._t["jobs"]),
+            {"candidate_ids": candidate_ids},
+        )
+        failed_ids: list[str] = []
+        queues: set[str] = set()
+        for r in await cur.fetchall():
+            row_id = r["id"] if isinstance(r, dict) else r[0]
+            row_queue = r["queue"] if isinstance(r, dict) else r[1]
+            row_status = r["status"] if isinstance(r, dict) else r[2]
+            if row_status == "failed":
+                failed_ids.append(row_id)
+            else:
+                queues.add(row_queue)
+        return failed_ids, queues
+
+    async def reconcile_waiting(self, limit: int = 500) -> ReconcileResult:
+        """Settle ``waiting`` jobs whose dependencies have all settled.
+
+        ``settle_dependents`` only runs when a dependency settles through pgwerk. A
+        dependency that settles any other way (or a crash between the job and dep
+        inserts on old versions) leaves its dependents in ``waiting`` forever. This
+        periodic pass finds them and applies the same transition, cascading failures
+        to their own dependents. Rows locked elsewhere are skipped.
+
+        Args:
+            limit: Maximum number of ``waiting`` jobs to settle in one call.
+        """
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                SQL("""
+                    SELECT j.id::text
+                    FROM {jobs} j
+                    WHERE j.status = 'waiting'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {deps} d
+                          JOIN {jobs} jd ON jd.id = d.depends_on
+                          WHERE d.job_id = j.id
+                            AND jd.status NOT IN ('complete', 'failed', 'aborted')
+                      )
+                    ORDER BY j.enqueued_at
+                    LIMIT %(limit)s
+                    FOR UPDATE OF j SKIP LOCKED
+                """).format(deps=self._t["deps"], jobs=self._t["jobs"]),
+                {"limit": limit},
+            )
+            candidate_ids = [r["id"] for r in await cur.fetchall()]
+            if not candidate_ids:
+                return ReconcileResult(queued=0, failed=0)
+
+            failed_ids, notify_queues = await self._settle_candidates(cur, candidate_ids)
+            queued = len(candidate_ids) - len(failed_ids)
+            for jid in failed_ids:
+                notify_queues.update(await self.settle_dependents(cur, jid))
+            for queue in notify_queues:
+                await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{queue}")))
+
+        return ReconcileResult(queued=queued, failed=len(failed_ids))
 
 
 class WorkerRepository:

@@ -17,6 +17,7 @@ from psycopg.sql import SQL
 from psycopg.sql import Identifier
 
 from .repos import JobRepository
+from .repos import ReconcileResult
 from .repos import StatsRepository
 from .repos import WorkerRepository
 from .repos import ScheduleRepository
@@ -871,6 +872,26 @@ class Werk:
                 await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
         return result.job_ids
 
+    async def reconcile_waiting(self, limit: int = 500) -> ReconcileResult:
+        """Settle ``waiting`` jobs whose dependencies have all settled.
+
+        Recovers dependents stranded in ``waiting`` because their dependency settled
+        without running ``settle_dependents``. They are queued, or failed with
+        ``error = 'dependency failed'`` when a required dependency failed. Runs as
+        part of maintenance; safe to run from several processes at once.
+
+        Args:
+            limit: Maximum number of jobs to settle in one call.
+        """
+        result = await self._job_repo.reconcile_waiting(limit=limit)
+        if result.queued or result.failed:
+            logger.warning(
+                "werk: reconciled %d stranded waiting job(s): %d queued, %d failed",
+                result.queued + result.failed,
+                result.queued,
+                result.failed,
+            )
+        return result
 
     async def delete_job(self, job_id: str) -> None:
         """Permanently delete a single job row by ID.
