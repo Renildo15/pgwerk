@@ -118,4 +118,7 @@ def api(
         port=port,
         reload=reload,
         log_level=log_level.lower(),
+        # Open claim long-polls would otherwise hold a graceful shutdown for up to
+        # remote_claim_wait; clients retry a cut claim with the same claim_id.
+        timeout_graceful_shutdown=10 if remote_workers else None,
     )

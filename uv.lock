@@ -874,6 +874,7 @@ cron = [
 ]
 dev = [
     { name = "croniter" },
+    { name = "httpx" },
     { name = "litestar" },
     { name = "mkdocs-shadcn" },
     { name = "mypy" },
@@ -890,12 +891,17 @@ dev = [
 exporter = [
     { name = "prometheus-client" },
 ]
+remote = [
+    { name = "httpx" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "croniter", marker = "extra == 'cron'", specifier = ">=2.0" },
     { name = "croniter", marker = "extra == 'dev'", specifier = ">=2.0" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'remote'", specifier = ">=0.27" },
     { name = "litestar", marker = "extra == 'api'", specifier = ">=2.0" },
     { name = "litestar", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "mkdocs-shadcn", marker = "extra == 'dev'", specifier = ">=0.10" },
@@ -915,7 +921,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
 ]
-provides-extras = ["api", "cron", "exporter", "analytics", "dev"]
+provides-extras = ["api", "remote", "cron", "exporter", "analytics", "dev"]
 
 [[package]]
 name = "platformdirs"
