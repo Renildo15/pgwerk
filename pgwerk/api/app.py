@@ -31,21 +31,38 @@ def create_app(config: WerkConfig | None = None) -> Litestar:
     on_startup: list = []
     on_shutdown: list = []
 
-    api_guards = []
-    if config.api_token:
-        api_guards.append(make_bearer_guard(config.api_token))
-    route_handlers: list = [make_router(guards=api_guards)]
+    if config.remote_workers and config.api and not config.api_token:
+        # Mounting /remote puts this process on the internet; an open admin API next
+        # to it would be too.
+        raise RuntimeError(
+            "remote_workers=True requires api_token (PGWERK_API_TOKEN / --api-token), "
+            "or api=False (--no-api) to serve only the remote router"
+        )
+
+    route_handlers: list = []
+    if config.api:
+        api_guards = []
+        if config.api_token:
+            api_guards.append(make_bearer_guard(config.api_token))
+        route_handlers.append(make_router(guards=api_guards))
 
     init_werk(config, state, dependencies, on_startup, on_shutdown)
 
-    if config.maintenance:
+    if config.remote_workers:
+        from ..remote.server import init_remote
+        from ..remote.server import make_remote_router
+
+        route_handlers.append(make_remote_router(state))
+        init_remote(config, state, on_startup, on_shutdown)
+
+    if config.maintenance_enabled:
         init_maintenance(state, on_startup, on_shutdown)
 
     if config.metrics:
         init_exporter(config.metrics_interval, state, on_startup, on_shutdown)
         route_handlers.append(MetricsController)
 
-    if config.ui:
+    if config.ui and config.api:  # the dashboard is a client of /api
         spa_guard = None
         if config.ui_auth:
             user, _, password = config.ui_auth.partition(":")

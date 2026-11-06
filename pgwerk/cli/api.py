@@ -28,11 +28,25 @@ from ..logging import configure_logging
 @click.option("--ui-auth", default=None, envvar="PGWERK_UI_AUTH", help="Basic Auth for the SPA as user:password.")
 @click.option("--api-token", default=None, envvar="PGWERK_API_TOKEN", help="Bearer token for the API.")
 @click.option(
-    "--maintenance",
+    "--maintenance/--no-maintenance",
+    default=None,
+    envvar="PGWERK_MAINTENANCE",
+    help="Run the maintenance pass (sweep, stranded-job recovery) in this process. "
+    "Default: on with --remote-workers, off otherwise.",
+)
+@click.option(
+    "--remote-workers",
     is_flag=True,
     default=False,
-    envvar="PGWERK_MAINTENANCE",
-    help="Run the maintenance pass (sweep, stranded-job recovery) in this process.",
+    envvar="PGWERK_REMOTE_WORKERS",
+    help="Serve the remote-worker protocol at /remote/v1 (experimental). Requires --api-token or --no-api.",
+)
+@click.option(
+    "--no-api",
+    is_flag=True,
+    default=False,
+    envvar="PGWERK_NO_API",
+    help="Don't serve the admin API (and dashboard): only the remote router.",
 )
 @click.option(
     "--log-level",
@@ -62,7 +76,9 @@ def api(
     no_ui: bool,
     ui_auth: str | None,
     api_token: str | None,
-    maintenance: bool,
+    maintenance: bool | None,
+    remote_workers: bool,
+    no_api: bool,
     log_level: str,
     log_format: str,
     no_color: bool,
@@ -88,7 +104,11 @@ def api(
         ui_auth=ui_auth,
         api_token=api_token,
         maintenance=maintenance,
+        remote_workers=remote_workers,
+        api=not no_api,
     )
+    if remote_workers and not no_api and not api_token:
+        raise click.ClickException("--remote-workers requires --api-token (or --no-api)")
 
     config.to_env()
     uvicorn.run(

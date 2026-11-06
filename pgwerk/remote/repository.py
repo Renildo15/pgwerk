@@ -38,6 +38,10 @@ if TYPE_CHECKING:
     from ..connection import Connect
 
 
+class ClaimSpent(Exception):
+    """This claim id already got an attempt, and that attempt is over."""
+
+
 @dataclass(frozen=True)
 class Session:
     """An authenticated remote worker, for the duration of one call."""
@@ -300,12 +304,13 @@ class RemoteRepository:
             return await self._authenticate(cur, token, claiming=claiming)
 
     async def claim(self, token: tokens.ParsedToken, claim_id: str, lease_ttl: int) -> Claimed | None:
-        """Claim one job for the worker, or ``None`` if there is nothing (or the claim id is spent).
+        """Claim one job for the worker, or ``None`` if there is nothing to claim.
 
         A retried claim with the same *claim_id* (its response was lost) gets the same
         lease back while the attempt still owns the job. Once that attempt is over
-        (settled, lost, released), the claim id is spent: ``None``, and the client
-        claims again with a fresh one.
+        (settled, lost, released), the claim id is spent and :class:`ClaimSpent` is
+        raised: the server answers "nothing" at once, and the client claims again
+        with a fresh id.
         """
         assert self._jobs is not None
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
@@ -330,7 +335,7 @@ class RemoteRepository:
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    return None
+                    raise ClaimSpent()
                 job = Job.from_row(row, self._jobs._serializer)
                 return Claimed(job, job.heartbeat_secs or lease_ttl)
 

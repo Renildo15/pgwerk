@@ -106,7 +106,10 @@ class TestClaim:
         await app._remote_repo.report(wtoken, claimed.job.lease_id, Outcome("complete"))
         await app.enqueue(noop)
 
-        assert await app._remote_repo.claim(wtoken, cid, 60) is None
+        from pgwerk.remote.repository import ClaimSpent
+
+        with pytest.raises(ClaimSpent):
+            await app._remote_repo.claim(wtoken, cid, 60)
         assert len(await app.get_executions(job.id)) == 1
 
     async def test_draining_worker_cannot_claim_but_can_report(self, app):

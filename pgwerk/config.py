@@ -54,6 +54,7 @@ class WerkConfig:
         maintenance: Run the maintenance pass (sweep, stranded ``waiting`` job
             reconciliation, rescheduling) inside the API process, every
             ``sweep_interval``. Lets stuck jobs recover with no worker running.
+            ``None`` (default): on when ``remote_workers`` is on, off otherwise.
         purge_expired: Let maintenance delete finished jobs whose ``_result_ttl``
             or ``_failure_ttl`` ran out (and stopped worker rows past their
             expiry). Set ``False`` to keep every row.
@@ -122,7 +123,7 @@ class WerkConfig:
     ui: bool = True
     ui_auth: str | None = None
     api_token: str | None = None
-    maintenance: bool = False
+    maintenance: bool | None = None
 
     # LISTEN/NOTIFY
     listen: bool = True
@@ -150,6 +151,11 @@ class WerkConfig:
 
     # Dangerous operations
     allow_truncate: bool = False
+
+    @property
+    def maintenance_enabled(self) -> bool:
+        """Whether the API process runs maintenance (``maintenance``, or ``remote_workers`` if unset)."""
+        return self.maintenance if self.maintenance is not None else self.remote_workers
 
     @classmethod
     def from_env(cls) -> "WerkConfig":
@@ -181,7 +187,7 @@ class WerkConfig:
             ui=not _bool("PGWERK_NO_UI", False),
             ui_auth=os.environ.get("PGWERK_UI_AUTH"),
             api_token=os.environ.get("PGWERK_API_TOKEN"),
-            maintenance=_bool("PGWERK_MAINTENANCE", False),
+            maintenance=_bool("PGWERK_MAINTENANCE", False) if os.environ.get("PGWERK_MAINTENANCE") else None,
             default_retry_backoff=_bool("PGWERK_DEFAULT_RETRY_BACKOFF", True),
             purge_expired=_bool("PGWERK_PURGE_EXPIRED", True),
             remote_workers=_bool("PGWERK_REMOTE_WORKERS", False),
@@ -219,7 +225,10 @@ class WerkConfig:
             os.environ["PGWERK_UI_AUTH"] = self.ui_auth
         if self.api_token:
             os.environ["PGWERK_API_TOKEN"] = self.api_token
-        os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
+        if self.maintenance is None:
+            os.environ.pop("PGWERK_MAINTENANCE", None)
+        else:
+            os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
         os.environ["PGWERK_DEFAULT_RETRY_BACKOFF"] = "true" if self.default_retry_backoff else "false"
         os.environ["PGWERK_PURGE_EXPIRED"] = "true" if self.purge_expired else "false"
         os.environ["PGWERK_REMOTE_WORKERS"] = "true" if self.remote_workers else "false"

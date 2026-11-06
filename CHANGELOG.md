@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Remote workers (experimental):** `werk api --remote-workers` serves the remote-worker protocol at `/remote/v1` (`register`, `claim` long-poll, lease `heartbeat`, `complete`, `fail`, `deregister`). It requires `--api-token`, or `--no-api` to serve only the remote router, and turns maintenance on unless `--no-maintenance`. It enforces request size limits and a per-worker claim rate limit (per server replica). The protocol may still change without a version bump.
 - Remote-worker access management (experimental): `werk token create|list|revoke` and `Werk.create_enrollment_token()` / `list_enrollment_tokens()` / `revoke_enrollment_token()` manage enrollment tokens scoped to queues. `werk workers revoke [--drain]` / `Werk.revoke_worker()` retires one remote worker. Revoking releases the revoked workers' jobs back to the queue without counting them as lost. `--drain` instead lets the worker finish what it holds.
 - Dashboard: a **Functions** page lists unroutable jobs (by queue and function) and the function catalog, and the Overview's queue table flags queues that have unroutable jobs.
 - Function catalog: functions that workers declare are recorded with the languages that registered them. Read it with `Werk.list_functions()` or `GET /api/functions`. It is informational only, and enqueue never consults it.

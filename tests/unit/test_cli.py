@@ -234,3 +234,20 @@ class TestRemoteAdminCommands:
         monkeypatch.setenv("PGWERK_DSN", "postgresql://x/y")
         result = CliRunner().invoke(cli, ["token", "create"])
         assert result.exit_code != 0 and "--name" in result.output
+
+
+class TestApiRemoteFlags:
+    def test_flags_exist(self):
+        out = CliRunner().invoke(cli, ["api", "--help"]).output
+        assert "--remote-workers" in out and "--no-api" in out and "--no-maintenance" in out
+
+    def test_remote_workers_needs_a_token_or_no_api(self, monkeypatch):
+        import sys
+        import types
+
+        monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(run=lambda *a, **k: None))
+        monkeypatch.delenv("PGWERK_API_TOKEN", raising=False)
+        result = CliRunner().invoke(cli, ["api", "--dsn", "postgresql://x/y", "--remote-workers"])
+        assert result.exit_code != 0 and "--api-token" in result.output
+        ok = CliRunner().invoke(cli, ["api", "--dsn", "postgresql://x/y", "--remote-workers", "--no-api"])
+        assert ok.exit_code == 0, ok.output
