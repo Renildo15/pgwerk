@@ -83,8 +83,11 @@ class TestFailureModeDeleteFencing:
                 {"other": str(uuid.uuid4()), "id": job.id},
             )
 
-        ok = await app._worker_repo.nack(wid, claimed, "boom", "failed", None, None, delete=True)
-        assert ok is False
+        from pgwerk.settlement import Fence
+        from pgwerk.settlement import Outcome
+
+        settled = await app._settlement.settle(claimed, Fence(job.id, wid, claimed.attempts), Outcome("fail", "boom"))
+        assert settled.status is None
         assert (await app.get_job(job.id)).status == JobStatus.Active
 
     async def test_dependent_of_deleted_failure_fails(self, app):

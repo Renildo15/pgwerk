@@ -16,7 +16,6 @@ from typing import Any
 from typing import Callable
 from datetime import datetime
 from datetime import timezone
-from datetime import timedelta
 
 import psycopg
 
@@ -24,7 +23,6 @@ from psycopg.sql import SQL
 from psycopg.sql import Identifier
 
 from ..utils import call_hook
-from ..utils import invoke_callback
 from ..commons import JobStatus
 from ..commons import DequeueStrategy
 from ..logging import job_id_var
@@ -32,6 +30,8 @@ from ..schemas import Job
 from ..schemas import Context
 from ..serializers import encode
 from ..maintenance import Maintenance
+from ..settlement import Fence
+from ..settlement import Outcome
 
 
 if TYPE_CHECKING:
@@ -578,90 +578,57 @@ class BaseWorker(abc.ABC):
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
 
+    def _fence(self, job: Job) -> Fence:
+        return Fence(job_id=job.id, worker_id=self.id, attempt=job.attempts)
+
     async def _ack(self, job: Job, result: Any = None) -> None:
-        result_json = encode(self.app.serializer, result)
-        expires_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=job.result_ttl) if job.result_ttl is not None else None
-        )
-
-        worker_repo = self.app._worker_repo
-        status = await worker_repo.ack(self.id, job, result_json, expires_at)
-        if status is None:
-            return  # race detected; logged by repo
-
-        if status == JobStatus.Aborted:
+        outcome = Outcome("complete", result_json=encode(self.app.serializer, result))
+        settled = await self.app._settlement.settle(job, self._fence(job), outcome)
+        if settled.status is None:
+            logger.warning(
+                "ack race detected for job %s [%s] — row no longer owned by this worker", job.function, job.id
+            )
+        elif settled.status == JobStatus.Aborted:
             logger.info("Worker %s: aborted %s [%s]", self.name, job.function, job.id)
-            if job.on_stopped:
-                await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
-            return
-
-        if job.repeat_remaining and job.repeat_remaining > 0:
-            await self.app._reenqueue_repeat(job)
-
-        if job.on_success:
-            await invoke_callback(job.on_success, job, timeout=job.on_success_timeout)
-        logger.info("Worker %s: completed %s [%s]", self.name, job.function, job.id)
+        elif settled.status == JobStatus.Complete:
+            logger.info("Worker %s: completed %s [%s]", self.name, job.function, job.id)
 
     async def _nack(self, job: Job, error: str, *, aborted: bool = False) -> None:
-        worker_repo = self.app._worker_repo
-        is_terminal_delete = (not aborted and job.attempts >= job.max_attempts and job.failure_mode == "delete") or (
-            aborted and job.failure_mode == "delete"
-        )
+        outcome = Outcome("abort") if aborted else Outcome("fail", error=error)
+        settled = await self.app._settlement.settle(job, self._fence(job), outcome)
+        t = settled.transition
+        if t is None:
+            logger.warning(
+                "nack race detected for job %s [%s] — row no longer owned by this worker, skipping",
+                job.function,
+                job.id,
+            )
+            return
 
-        will_retry = not aborted and job.attempts < job.max_attempts
-
-        scheduled_at: datetime | None = None
-        if will_retry and job.retry_intervals:
-            idx = min(job.attempts - 1, len(job.retry_intervals) - 1)
-            delay = job.retry_intervals[idx]
-            if delay:
-                scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
-
-        if aborted:
-            new_status = "aborted"
-        elif will_retry and scheduled_at:
-            new_status = "scheduled"
-        elif will_retry:
-            new_status = "queued"
-        else:
-            new_status = "failed"
-        is_terminal = new_status in ("failed", "aborted")
-
-        expires_at: datetime | None = None
-        if is_terminal and job.failure_ttl is not None:
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=job.failure_ttl)
-
-        if not await worker_repo.nack(
-            self.id, job, error, new_status, scheduled_at, expires_at, delete=is_terminal_delete
-        ):
-            return  # race detected; logged by repo
-
-        if is_terminal_delete:
+        if t.delete:
             logger.info(
                 "Worker %s: deleted %s [%s] on terminal failure (failure_mode=delete)", self.name, job.function, job.id
             )
-        elif will_retry:
-            if scheduled_at:
-                delay_secs = (scheduled_at - datetime.now(timezone.utc)).total_seconds()
-                logger.info(
-                    "Worker %s: retrying %s [%s] in %.0fs (attempt %d/%d)",
-                    self.name,
-                    job.function,
-                    job.id,
-                    delay_secs,
-                    job.attempts,
-                    job.max_attempts,
-                )
-            else:
-                logger.info(
-                    "Worker %s: retrying %s [%s] immediately (attempt %d/%d)",
-                    self.name,
-                    job.function,
-                    job.id,
-                    job.attempts,
-                    job.max_attempts,
-                )
-        else:
+        elif t.retrying and t.scheduled_at:
+            logger.info(
+                "Worker %s: retrying %s [%s] in %.0fs (attempt %d/%d)",
+                self.name,
+                job.function,
+                job.id,
+                (t.scheduled_at - datetime.now(timezone.utc)).total_seconds(),
+                job.attempts,
+                job.max_attempts,
+            )
+        elif t.retrying:
+            logger.info(
+                "Worker %s: retrying %s [%s] immediately (attempt %d/%d)",
+                self.name,
+                job.function,
+                job.id,
+                job.attempts,
+                job.max_attempts,
+            )
+        elif t.status == JobStatus.Failed:
             logger.warning(
                 "Worker %s: giving up on %s [%s] after %d/%d attempts",
                 self.name,
@@ -670,14 +637,8 @@ class BaseWorker(abc.ABC):
                 job.attempts,
                 job.max_attempts,
             )
-
-        if aborted and job.on_stopped:
-            await invoke_callback(job.on_stopped, job, timeout=job.on_stopped_timeout)
-        elif is_terminal and not aborted and job.on_failure:
-            await invoke_callback(job.on_failure, job, timeout=job.on_failure_timeout)
-
-        if will_retry and not scheduled_at:
-            await worker_repo.notify(job.queue)
+        elif t.status == JobStatus.Aborted:
+            logger.info("Worker %s: aborted %s [%s]", self.name, job.function, job.id)
 
     async def _requeue_cancelled(self, job: Job) -> None:
         worker_repo = self.app._worker_repo

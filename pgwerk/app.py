@@ -45,6 +45,7 @@ from .schemas import Dependency
 from .schemas import JobExecution
 from .schemas import EnqueueParams
 from .database import DatabaseManager
+from .settlement import Settlement
 from .connection import Connect
 from .connection import AsyncConnection
 from .exceptions import JobError
@@ -117,6 +118,7 @@ class Werk:
 
         self.__job_repo: JobRepository | None = None
         self.__worker_repo: WorkerRepository | None = None
+        self.__settlement: Settlement | None = None
         self.__stats_repo: StatsRepository | None = None
         self.__schedule_repo: ScheduleRepository | None = None
 
@@ -141,6 +143,12 @@ class Werk:
                 self._connect, self._t, self.prefix, self.serializer, self._job_repo
             )
         return self.__worker_repo
+
+    @property
+    def _settlement(self) -> Settlement:
+        if self.__settlement is None:
+            self.__settlement = Settlement(self._connect, self._job_repo)
+        return self.__settlement
 
     @property
     def _stats_repo(self) -> StatsRepository:
@@ -732,14 +740,6 @@ class Werk:
         if timeout is not None:
             return await asyncio.wait_for(_poll(), timeout=timeout)
         return await _poll()
-
-    async def _reenqueue_repeat(self, job: Job) -> None:
-        """Re-enqueue a repeating job after it completes one iteration.
-
-        Args:
-            job: The completed :class:`Job` that has a repeat policy.
-        """
-        await self._job_repo.reenqueue_repeat(job)
 
     # ------------------------------------------------------------------
     # Jobs

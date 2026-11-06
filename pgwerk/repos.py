@@ -23,7 +23,6 @@ from psycopg.sql import Placeholder
 from psycopg.rows import dict_row
 
 from .utils import compute_next_run
-from .commons import JobStatus
 from .commons import DequeueStrategy
 from .schemas import JOB_COLS
 from .schemas import Job
@@ -512,7 +511,127 @@ class JobRepository:
 
         return SweepResult(job_ids=swept_ids, aborted=aborted)
 
-    async def reenqueue_repeat(self, job: Job) -> None:
+    # ------------------------------------------------------------------
+    # Settlement helpers (cursor-level; composed by pgwerk.settlement)
+    # ------------------------------------------------------------------
+
+    async def lock_for_settle(self, cur: Any, job_id: str, worker_id: str | None) -> str | None:
+        """Lock a job that is still ``active``/``aborting`` and return its status.
+
+        With *worker_id*, the row must still belong to that worker. Returns ``None``
+        when nothing matches: the attempt no longer owns the job.
+        """
+        await cur.execute(
+            SQL("""
+                SELECT status
+                FROM {jobs}
+                WHERE id = %(id)s
+                  AND status IN ('active', 'aborting')
+                  AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid)
+                FOR UPDATE
+            """).format(jobs=self._t["jobs"]),
+            {"id": job_id, "wid": worker_id},
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return row["status"] if isinstance(row, dict) else row[0]
+
+    async def write_settled(
+        self,
+        cur: Any,
+        job_id: str,
+        *,
+        status: str,
+        error: str | None,
+        result_json: str | None,
+        scheduled_at: datetime | None,
+        expires_at: datetime | None,
+    ) -> None:
+        """Write a settled status onto a row locked by :meth:`lock_for_settle`.
+
+        ``complete`` stores the result and keeps the previous error; ``aborted``
+        clears the result; a failure or retry keeps the result and stores the error.
+        A retry (``queued``/``scheduled``) clears ``started_at``.
+        """
+        await cur.execute(
+            SQL("""
+                UPDATE {jobs}
+                SET status       = %(status)s,
+                    result       = CASE %(status)s
+                                       WHEN 'complete' THEN %(result)s::jsonb
+                                       WHEN 'aborted'  THEN NULL
+                                       ELSE result END,
+                    error        = CASE WHEN %(status)s = 'complete' THEN error ELSE %(error)s END,
+                    expires_at   = %(expires_at)s,
+                    worker_id    = NULL,
+                    touched_at   = CASE WHEN %(status)s = 'complete' THEN touched_at ELSE NULL END,
+                    started_at   = CASE WHEN %(status)s IN ('queued', 'scheduled') THEN NULL ELSE started_at END,
+                    scheduled_at = COALESCE(%(scheduled_at)s::timestamptz, scheduled_at),
+                    completed_at = CASE WHEN %(status)s IN ('complete', 'failed', 'aborted')
+                                        THEN NOW() ELSE NULL END
+                WHERE id = %(id)s
+            """).format(jobs=self._t["jobs"]),
+            {
+                "id": job_id,
+                "status": status,
+                "result": result_json,
+                "error": error,
+                "expires_at": expires_at,
+                "scheduled_at": scheduled_at,
+            },
+        )
+
+    async def close_execution(
+        self,
+        cur: Any,
+        job_id: str,
+        worker_id: str | None,
+        *,
+        status: str,
+        result_json: str | None,
+        error: str | None,
+    ) -> None:
+        """Close the job's ``running`` execution row(s), optionally only the worker's."""
+        await cur.execute(
+            SQL("""
+                UPDATE {executions}
+                SET status = %(status)s, result = %(result)s, error = %(error)s, completed_at = NOW()
+                WHERE job_id = %(jid)s
+                  AND status = 'running'
+                  AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid)
+            """).format(executions=self._t["executions"]),
+            {"jid": job_id, "wid": worker_id, "status": status, "result": result_json, "error": error},
+        )
+
+    async def release_claim(self, cur: Any, job_id: str, worker_id: str | None) -> None:
+        """Drop the job's claim row(s) from ``worker_jobs``."""
+        await cur.execute(
+            SQL("""
+                DELETE FROM {worker_jobs}
+                WHERE job_id = %(jid)s AND (%(wid)s::uuid IS NULL OR worker_id = %(wid)s::uuid)
+            """).format(worker_jobs=self._t["worker_jobs"]),
+            {"jid": job_id, "wid": worker_id},
+        )
+
+    async def delete_settled(self, cur: Any, job_id: str) -> None:
+        """Delete a job that was just settled in this transaction (``failure_mode=delete``).
+
+        Callers must run :meth:`settle_dependents` first: the job's dep rows cascade
+        away with it.
+        """
+        await cur.execute(
+            SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
+            {"id": job_id},
+        )
+
+    async def insert_repeat(self, cur: Any, job: Job) -> None:
+        """Insert the next run of a repeating job, in the caller's transaction.
+
+        Running inside the settle transaction means a crash can't lose the next run
+        after the current one is marked complete, and a replayed settle (which fails
+        the fence) can't insert it twice.
+        """
         if job.repeat_intervals:
             delay = job.repeat_intervals[0]
             next_intervals: list[int] | None = (
@@ -523,38 +642,39 @@ class JobRepository:
             next_intervals = None
 
         scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        await cur.execute(
+            SQL("""
+                INSERT INTO {jobs} (
+                    function, queue, status, priority, group_key, payload,
+                    max_attempts, timeout_secs, heartbeat_secs, scheduled_at,
+                    meta, result_ttl, failure_ttl, ttl,
+                    on_success, on_failure, on_stopped,
+                    on_success_timeout, on_failure_timeout, on_stopped_timeout,
+                    retry_intervals,
+                    repeat_remaining, repeat_interval_secs, repeat_intervals
+                )
+                SELECT
+                    function, queue, 'queued', priority, group_key, payload,
+                    max_attempts, timeout_secs, heartbeat_secs, %(scheduled_at)s,
+                    meta, result_ttl, failure_ttl, ttl,
+                    on_success, on_failure, on_stopped,
+                    on_success_timeout, on_failure_timeout, on_stopped_timeout,
+                    retry_intervals,
+                    %(remaining)s, repeat_interval_secs, %(repeat_intervals)s
+                FROM {jobs}
+                WHERE id = %(id)s
+            """).format(jobs=self._t["jobs"]),
+            {
+                "id": job.id,
+                "scheduled_at": scheduled_at,
+                "remaining": (job.repeat_remaining or 1) - 1,
+                "repeat_intervals": encode(self._serializer, next_intervals),
+            },
+        )
 
-        async with await self._connect() as conn:
-            await conn.execute(
-                SQL("""
-                    INSERT INTO {jobs} (
-                        function, queue, status, priority, group_key, payload,
-                        max_attempts, timeout_secs, heartbeat_secs, scheduled_at,
-                        meta, result_ttl, failure_ttl, ttl,
-                        on_success, on_failure, on_stopped,
-                        on_success_timeout, on_failure_timeout, on_stopped_timeout,
-                        retry_intervals,
-                        repeat_remaining, repeat_interval_secs, repeat_intervals
-                    )
-                    SELECT
-                        function, queue, 'queued', priority, group_key, payload,
-                        max_attempts, timeout_secs, heartbeat_secs, %(scheduled_at)s,
-                        meta, result_ttl, failure_ttl, ttl,
-                        on_success, on_failure, on_stopped,
-                        on_success_timeout, on_failure_timeout, on_stopped_timeout,
-                        retry_intervals,
-                        %(remaining)s, repeat_interval_secs, %(repeat_intervals)s
-                    FROM {jobs}
-                    WHERE id = %(id)s
-                """).format(jobs=self._t["jobs"]),
-                {
-                    "id": job.id,
-                    "scheduled_at": scheduled_at,
-                    "remaining": (job.repeat_remaining or 1) - 1,
-                    "repeat_intervals": encode(self._serializer, next_intervals),
-                },
-            )
-            await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{job.queue}")))
+    async def notify(self, cur: Any, queue: str) -> None:
+        """``NOTIFY`` a queue's channel; inside a transaction it's delivered on commit."""
+        await cur.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{queue}")))
 
     # ------------------------------------------------------------------
     # Shared graph helpers (also used by WorkerRepository)
@@ -1122,177 +1242,6 @@ class WorkerRepository:
     # ------------------------------------------------------------------
     # Ack / Nack / Requeue
     # ------------------------------------------------------------------
-
-    async def ack(
-        self,
-        worker_id: str,
-        job: Job,
-        result_json: str | None,
-        expires_at: datetime | None,
-    ) -> JobStatus | None:
-        """Settle a returned handler, honoring an abort committed before this UPDATE."""
-        async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:
-            await cur.execute(
-                SQL("""
-                    UPDATE {jobs}
-                    SET status = CASE WHEN status = 'aborting' THEN 'aborted' ELSE 'complete' END,
-                        result = CASE WHEN status = 'aborting' THEN NULL ELSE %(result)s::jsonb END,
-                        error = CASE WHEN status = 'aborting' THEN 'aborted' ELSE error END,
-                        completed_at = NOW(),
-                        expires_at = CASE WHEN status = 'aborting'
-                                          THEN NOW() + failure_ttl * INTERVAL '1 second'
-                                          ELSE %(expires_at)s END,
-                        worker_id = NULL,
-                        touched_at = CASE WHEN status = 'aborting' THEN NULL ELSE touched_at END
-                    WHERE id = %(id)s
-                      AND worker_id = %(wid)s::uuid
-                      AND status IN ('active', 'aborting')
-                    RETURNING status
-                """).format(jobs=self._t["jobs"]),
-                {"id": job.id, "result": result_json, "expires_at": expires_at, "wid": worker_id},
-            )
-            row = await cur.fetchone()
-            if row is None:
-                await cur.execute(
-                    SQL("SELECT status, worker_id FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-                    {"id": job.id},
-                )
-                state = await cur.fetchone()
-                logger.warning(
-                    "ack race detected for job %s [%s] — row no longer owned by this worker (db state: %s)",
-                    job.function,
-                    job.id,
-                    state,
-                )
-                return None
-
-            status = JobStatus(row[0])
-            await cur.execute(
-                SQL("""
-                    UPDATE {executions}
-                    SET status = %(status)s, result = %(result)s,
-                        error = %(error)s, completed_at = NOW()
-                    WHERE job_id = %(jid)s AND attempt = %(attempt)s AND worker_id = %(wid)s::uuid
-                """).format(executions=self._t["executions"]),
-                {
-                    "jid": job.id,
-                    "attempt": job.attempts,
-                    "status": status.value,
-                    "result": result_json if status == JobStatus.Complete else None,
-                    "error": "aborted" if status == JobStatus.Aborted else None,
-                    "wid": worker_id,
-                },
-            )
-            await cur.execute(
-                SQL("DELETE FROM {wj} WHERE worker_id = %(wid)s AND job_id = %(jid)s").format(
-                    wj=self._t["worker_jobs"]
-                ),
-                {"wid": worker_id, "jid": job.id},
-            )
-            unblocked_queues = await self._job_repo.settle_dependents(cur, job.id)
-            if status == JobStatus.Aborted and job.failure_mode == "delete":
-                await self._delete_settled(cur, job.id)
-            for q in unblocked_queues:
-                await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{q}")))
-
-        return status
-
-    async def nack(
-        self,
-        worker_id: str,
-        job: Job,
-        error: str,
-        new_status: str,
-        scheduled_at: datetime | None,
-        expires_at: datetime | None,
-        delete: bool = False,
-    ) -> bool:
-        """Settle a failed or aborted attempt under the worker fence.
-
-        With ``delete=True`` (``failure_mode=delete`` on a terminal status), the row is
-        deleted in the same transaction, after its dependents are settled: the dep rows
-        cascade away with the job, so settling afterwards would leave dependents looking
-        as if the dependency had succeeded. A superseded attempt fails the fence and
-        deletes nothing.
-        """
-        is_terminal = new_status in ("failed", "aborted")
-        if delete and not is_terminal:
-            raise ValueError(f"delete=True requires a terminal status, got {new_status!r}")
-
-        async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:
-            await cur.execute(
-                SQL("""
-                    UPDATE {jobs}
-                    SET status       = %(status)s,
-                        error        = %(error)s,
-                        expires_at   = %(expires_at)s,
-                        worker_id    = NULL,
-                        touched_at   = NULL,
-                        started_at   = CASE WHEN %(status)s IN ('queued', 'scheduled') THEN NULL ELSE started_at END,
-                        scheduled_at = COALESCE(%(scheduled_at)s::timestamptz, scheduled_at),
-                        completed_at = CASE WHEN %(status)s IN ('failed', 'aborted')
-                                            THEN NOW() ELSE NULL END
-                    WHERE id = %(id)s
-                      AND worker_id = %(wid)s::uuid
-                      AND status IN ('active', 'aborting')
-                    RETURNING 1
-                """).format(jobs=self._t["jobs"]),
-                {
-                    "id": job.id,
-                    "status": new_status,
-                    "error": error,
-                    "expires_at": expires_at,
-                    "scheduled_at": scheduled_at,
-                    "wid": worker_id,
-                },
-            )
-            if not await cur.fetchone():
-                logger.warning(
-                    "nack race detected for job %s [%s] — row no longer owned by this worker, skipping",
-                    job.function,
-                    job.id,
-                )
-                return False
-
-            await cur.execute(
-                SQL("""
-                    UPDATE {executions}
-                    SET status = %(exec_status)s, error = %(error)s, completed_at = NOW()
-                    WHERE job_id = %(jid)s AND attempt = %(attempt)s AND worker_id = %(wid)s::uuid
-                """).format(executions=self._t["executions"]),
-                {
-                    "jid": job.id,
-                    "attempt": job.attempts,
-                    "error": error,
-                    "exec_status": "aborted" if new_status == "aborted" else "failed",
-                    "wid": worker_id,
-                },
-            )
-            await cur.execute(
-                SQL("DELETE FROM {wj} WHERE worker_id = %(wid)s AND job_id = %(jid)s").format(
-                    wj=self._t["worker_jobs"]
-                ),
-                {"wid": worker_id, "jid": job.id},
-            )
-            if is_terminal:
-                unblocked_queues = await self._job_repo.settle_dependents(cur, job.id)
-                if delete:
-                    await self._delete_settled(cur, job.id)
-                for q in unblocked_queues:
-                    await conn.execute(SQL("NOTIFY {ch}").format(ch=Identifier(f"{self._prefix}:{q}")))
-
-        return True
-
-    async def _delete_settled(self, cur: Any, job_id: str) -> None:
-        """Delete a job that was just settled in this transaction (``failure_mode=delete``).
-
-        Callers must run ``settle_dependents`` first: the job's dep rows cascade away
-        with it.
-        """
-        await cur.execute(
-            SQL("DELETE FROM {jobs} WHERE id = %(id)s").format(jobs=self._t["jobs"]),
-            {"id": job_id},
-        )
 
     async def requeue_cancelled(self, worker_id: str, job: Job) -> None:
         async with await self._connect() as conn, conn.transaction(), conn.cursor() as cur:

@@ -26,6 +26,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `werk purge` now goes through `Werk.purge_jobs`, which gained optional `queue` and `older_than_days=None` arguments. The `--older-than` option the docs described now exists.
 - Enqueueing a job with dependencies writes the job and its dependency rows in one transaction, so a crash in between can no longer leave a `waiting` job with no dependencies.
 - API bearer-token and dashboard Basic Auth checks compare in constant time.
+- The next run of a repeating job is inserted in the same transaction that marks the current run complete. Previously it was inserted afterwards, and a crash in between ended the repeat chain.
+- A handler that raises while an abort is pending now ends `aborted` (running `on_stopped`), the same as a handler that returns. Previously the failure could requeue it for a retry, undoing the abort.
 
 ---
 

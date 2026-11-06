@@ -12,14 +12,24 @@ from __future__ import annotations
 
 import logging
 
+from typing import TYPE_CHECKING
+from typing import Any
 from typing import Literal
 from datetime import datetime
 from datetime import timezone
 from datetime import timedelta
 from dataclasses import dataclass
 
+from psycopg.rows import dict_row
+
+from .utils import invoke_callback
 from .commons import JobStatus
 from .schemas import Job
+
+
+if TYPE_CHECKING:
+    from .repos import JobRepository
+    from .connection import Connect
 
 
 logger = logging.getLogger(__name__)
@@ -153,3 +163,100 @@ def plan(job: Job, outcome: Outcome, now: datetime | None = None) -> Transition:
         )
 
     raise ValueError(f"unknown outcome kind: {outcome.kind!r}")
+
+
+_EXECUTION_STATUS = {
+    JobStatus.Complete: "complete",
+    JobStatus.Aborted: "aborted",
+    JobStatus.Failed: "failed",
+    JobStatus.Queued: "failed",
+    JobStatus.Scheduled: "failed",
+}
+
+
+class Settlement:
+    """Applies :func:`plan` decisions to the database.
+
+    Args:
+        connect: Connection factory (autocommit connections).
+        job_repo: Repository that owns the job tables.
+    """
+
+    def __init__(self, connect: "Connect", job_repo: "JobRepository") -> None:
+        self._connect = connect
+        self._jobs = job_repo
+
+    async def apply(self, cur: Any, job: Job, fence: Fence, outcome: Outcome) -> Settled:
+        """Settle *job* inside the caller's transaction. Callbacks are not run.
+
+        The row is locked and its current status read first. If an abort was
+        requested meanwhile (``aborting``), a ``complete`` or ``fail`` settles as an
+        abort instead: the abort wins, and a result that raced it is dropped.
+
+        In order: status and result/error, the execution row, the claim row,
+        dependents (on a terminal status), ``failure_mode=delete``, the next repeat,
+        and ``NOTIFY`` for the queues that gained runnable work.
+        """
+        current = await self._jobs.lock_for_settle(cur, fence.job_id, fence.worker_id)
+        if current is None:
+            return Settled(status=None)
+
+        if current == JobStatus.Aborting.value and outcome.kind != "abort":
+            outcome = Outcome("abort")
+        t = plan(job, outcome)
+
+        await self._jobs.write_settled(
+            cur,
+            job.id,
+            status=t.status.value,
+            error=t.error,
+            result_json=t.result_json,
+            scheduled_at=t.scheduled_at,
+            expires_at=t.expires_at,
+        )
+        await self._jobs.close_execution(
+            cur,
+            job.id,
+            fence.worker_id,
+            status=_EXECUTION_STATUS[t.status],
+            result_json=t.result_json if t.status == JobStatus.Complete else None,
+            error=t.error if t.status != JobStatus.Complete else None,
+        )
+        await self._jobs.release_claim(cur, job.id, fence.worker_id)
+
+        notify: set[str] = set()
+        if t.terminal:
+            notify.update(await self._jobs.settle_dependents(cur, job.id))
+        if t.delete:
+            await self._jobs.delete_settled(cur, job.id)
+        if t.repeat:
+            await self._jobs.insert_repeat(cur, job)
+            notify.add(job.queue)
+        if t.status == JobStatus.Queued:
+            notify.add(job.queue)
+        for queue in notify:
+            await self._jobs.notify(cur, queue)
+
+        return Settled(status=t.status, transition=t)
+
+    async def settle(self, job: Job, fence: Fence, outcome: Outcome, *, run_callbacks: bool = True) -> Settled:
+        """Settle *job* in its own transaction, then run its callback.
+
+        The callback runs after commit, so it never sees a state that could still
+        roll back. Delivery is at most once: if the process dies right after commit,
+        the callback is lost.
+        """
+        async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            settled = await self.apply(cur, job, fence, outcome)
+        if settled.status is None:
+            logger.debug("settle fence miss for job %s [%s]; nothing written", job.function, job.id)
+        elif run_callbacks:
+            await self.run_callback(job, settled)
+        return settled
+
+    @staticmethod
+    async def run_callback(job: Job, settled: Settled) -> None:
+        """Run the callback chosen for a settled job, if any. Never raises."""
+        t = settled.transition
+        if t is not None and t.callback:
+            await invoke_callback(t.callback, job, timeout=t.callback_timeout)
