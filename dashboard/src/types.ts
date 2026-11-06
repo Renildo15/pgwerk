@@ -186,3 +186,17 @@ export interface RequeueFailedRequest {
 export interface CancelQueuedRequest {
   queue?: string
 }
+
+/** A function some worker declared it handles (informational catalog entry). */
+export interface FunctionEntry {
+  name: string
+  languages: string[]
+  last_registered_at: string
+}
+
+/** Runnable jobs no live worker would claim, for one queue and function. */
+export interface UnroutableEntry {
+  queue: string
+  function: string
+  count: number
+}

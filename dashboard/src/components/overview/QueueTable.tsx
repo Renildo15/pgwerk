@@ -7,17 +7,53 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import { statusColor } from '@/components/StatusBadge'
-import type { QueueStats } from '@/types'
+import type { QueueStats, UnroutableEntry } from '@/types'
+import { AlertTriangle } from 'lucide-react'
+import { Link } from 'react-router-dom'
 
 const STATUS_COLS = ['queued', 'active', 'waiting', 'failed', 'complete', 'aborted'] as const
 
 interface QueueTableProps {
   queues: QueueStats[]
+  /** Runnable jobs no live worker would claim; flagged next to their queue. */
+  unroutable?: UnroutableEntry[]
 }
 
-export function QueueTable({ queues }: QueueTableProps) {
+function UnroutableFlag({ entries }: { entries: UnroutableEntry[] }) {
+  const total = entries.reduce((sum, e) => sum + e.count, 0)
   return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Link
+          to="/functions"
+          className="inline-flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-500"
+        >
+          <AlertTriangle className="h-3 w-3" />
+          {total} unroutable
+        </Link>
+      </TooltipTrigger>
+      <TooltipContent>
+        <p className="mb-1 text-xs">No live worker would claim:</p>
+        {entries.map(e => (
+          <p key={e.function} className="font-mono text-xs">
+            {e.function} × {e.count}
+          </p>
+        ))}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+export function QueueTable({ queues, unroutable = [] }: QueueTableProps) {
+  const unroutableByQueue = new Map<string, UnroutableEntry[]>()
+  for (const entry of unroutable) {
+    unroutableByQueue.set(entry.queue, [...(unroutableByQueue.get(entry.queue) ?? []), entry])
+  }
+
+  return (
+    <TooltipProvider>
     <Table>
       <TableHeader>
         <TableRow>
@@ -35,7 +71,12 @@ export function QueueTable({ queues }: QueueTableProps) {
           const total = STATUS_COLS.reduce((sum, s) => sum + (q[s] ?? 0), 0)
           return (
             <TableRow key={q.queue}>
-              <TableCell className="font-mono text-sm font-medium">{q.queue}</TableCell>
+              <TableCell className="font-mono text-sm font-medium">
+                <div className="flex flex-wrap items-center gap-2">
+                  {q.queue}
+                  {unroutableByQueue.has(q.queue) && <UnroutableFlag entries={unroutableByQueue.get(q.queue)!} />}
+                </div>
+              </TableCell>
               {STATUS_COLS.map(s => (
                 <TableCell key={s} className="text-right font-mono text-sm tabular-nums text-muted-foreground">
                   {q[s] ?? 0}
@@ -68,6 +109,7 @@ export function QueueTable({ queues }: QueueTableProps) {
         )}
       </TableBody>
     </Table>
+    </TooltipProvider>
   )
 }
 

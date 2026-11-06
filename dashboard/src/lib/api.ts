@@ -14,6 +14,8 @@ import type {
   PurgeResponse,
   RequeueFailedRequest,
   CancelQueuedRequest,
+  FunctionEntry,
+  UnroutableEntry,
 } from '@/types'
 
 const BASE = import.meta.env.VITE_API_URL ?? ''
@@ -92,6 +94,10 @@ export const api = {
   },
 
   listWorkers: () => req<WorkerResponse[]>('/api/workers'),
+
+  listFunctions: () => req<FunctionEntry[]>('/api/functions'),
+
+  listUnroutable: () => req<UnroutableEntry[]>('/api/functions/unroutable'),
 
   getThroughputHistory: (minutes = 1440) =>
     req<WorkerThroughputPoint[]>(`/api/stats/throughput?minutes=${minutes}`),

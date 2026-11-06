@@ -13,6 +13,7 @@ const nav = [
   { to: '/jobs', label: 'Jobs', end: false },
   { to: '/schedules', label: 'Schedules', end: false },
   { to: '/workers', label: 'Workers', end: false },
+  { to: '/functions', label: 'Functions', end: false },
 ]
 
 function formatBytes(bytes: number | undefined | null): string {

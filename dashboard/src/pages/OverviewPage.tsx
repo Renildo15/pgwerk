@@ -117,6 +117,12 @@ export function OverviewPage() {
     refetchInterval: 10_000,
   })
 
+  const { data: unroutable } = useQuery({
+    queryKey: ['functions', 'unroutable'],
+    queryFn: api.listUnroutable,
+    refetchInterval: 10_000,
+  })
+
   const { data: throughputHistory, refetch: refetchThroughput } = useQuery({
     queryKey: ['stats', 'throughput', chartMinutes],
     queryFn: () => api.getThroughputHistory(chartMinutes),
@@ -222,7 +228,7 @@ export function OverviewPage() {
           <CardContent className="p-0">
             {statsLoading || !stats
               ? <QueueTableSkeleton />
-              : <QueueTable queues={stats.queues} />}
+              : <QueueTable queues={stats.queues} unroutable={unroutable} />}
           </CardContent>
         </Card>
       </div>

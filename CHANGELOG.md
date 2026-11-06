@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Dashboard: a **Functions** page lists unroutable jobs (by queue and function) and the function catalog, and the Overview's queue table flags queues that have unroutable jobs.
 - Function catalog: functions that workers declare are recorded with the languages that registered them. Read it with `Werk.list_functions()` or `GET /api/functions`. It is informational only, and enqueue never consults it.
 - Function routing: `functions=[...]` on workers, `Werk.run(functions=...)` and `werk worker -f/--function` make a worker claim only jobs for those functions. Without it, a worker claims every function on its queues, as before.
 - `werk maintain`: runs the maintenance pass (sweep, stranded `waiting` job recovery, rescheduling) without a worker, so stuck jobs recover even when no worker is up. `--once` runs a single pass.
