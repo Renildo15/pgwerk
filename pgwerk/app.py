@@ -1236,6 +1236,7 @@ class Werk:
         queues: list[str] | None = None,
         concurrency: int = 10,
         worker_type: str = "async",
+        functions: list[str | Callable] | None = None,
     ) -> None:
         """Connect and run a worker until the process is interrupted.
 
@@ -1244,6 +1245,7 @@ class Werk:
             concurrency: Maximum number of jobs processed simultaneously.
             worker_type: One of ``"async"``, ``"thread"``, ``"process"``, or
                 ``"fork"``.
+            functions: Only claim jobs for these functions; ``None`` claims all.
         """
         _types: dict[str, type[AsyncWorker] | type[ThreadWorker] | type[ProcessWorker] | type[ForkWorker]] = {
             "async": AsyncWorker,
@@ -1254,7 +1256,7 @@ class Werk:
         cls = _types.get(worker_type, AsyncWorker)
 
         await self.connect()
-        w = cls(app=self, queues=queues or ["default"], concurrency=concurrency)
+        w = cls(app=self, queues=queues or ["default"], concurrency=concurrency, functions=functions)
         await w.run()
 
     # ------------------------------------------------------------------

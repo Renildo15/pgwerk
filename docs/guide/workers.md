@@ -73,6 +73,7 @@ All workers share these constructor parameters:
 | `abort_interval` | `1.0` | Seconds between abort-signal checks |
 | `shutdown_timeout` | `30.0` | Seconds to wait for in-flight jobs during shutdown |
 | `maintenance` | `True` | Run the maintenance pass in this worker (see [Maintenance](#maintenance)) |
+| `functions` | `None` | Only claim jobs for these functions (see [Function routing](#function-routing)) |
 
 ## Dequeue strategies
 
@@ -142,6 +143,25 @@ worker.push_exception_handler(report_error)
 ```
 
 Handlers are called in reverse push order (most recently pushed first). Use `pop_exception_handler()` to remove the top handler.
+
+## Function routing
+
+By default a worker claims every job on its queues. Pass `functions` to claim only some of
+them:
+
+```python
+# GPU image: only the rendering functions
+AsyncWorker(app=app, queues=["media"], functions=[render_thumbnail, "media.tasks.transcode"])
+```
+
+```bash
+werk worker myapp.tasks:app -q media -f media.tasks.render_thumbnail -f media.tasks.transcode
+```
+
+This splits one queue across deployments that can run different code, such as two images of
+the same codebase, without failing imports on jobs the worker can't run. Functions are matched
+exactly against the `function` stored at enqueue (the callable's dotted path). Group
+concurrency (`_group`) still counts every function in the group.
 
 ## Maintenance
 

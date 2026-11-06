@@ -1163,21 +1163,38 @@ class WorkerRepository:
     # Registration & heartbeat
     # ------------------------------------------------------------------
 
-    async def register(self, worker_id: str, name: str, queues: list[str], metadata: str, role: str = "worker") -> None:
+    async def register(
+        self,
+        worker_id: str,
+        name: str,
+        queues: list[str],
+        metadata: str,
+        role: str = "worker",
+        functions: list[str] | None = None,
+    ) -> None:
+        """Register (or re-register) a worker. ``functions=None`` means it handles all."""
         async with await self._connect() as conn, conn.transaction():
             await conn.execute(
                 SQL("""
-                    INSERT INTO {worker} (id, name, queue, status, role, metadata, heartbeat_at)
-                    VALUES (%(id)s, %(name)s, %(queue)s, 'active', %(role)s, %(meta)s, NOW())
+                    INSERT INTO {worker} (id, name, queue, status, role, metadata, heartbeat_at, functions)
+                    VALUES (%(id)s, %(name)s, %(queue)s, 'active', %(role)s, %(meta)s, NOW(), %(functions)s)
                     ON CONFLICT (id) DO UPDATE
                         SET name = EXCLUDED.name,
                             queue = EXCLUDED.queue,
                             status = 'active',
                             role = EXCLUDED.role,
                             metadata = EXCLUDED.metadata,
-                            heartbeat_at = NOW()
+                            heartbeat_at = NOW(),
+                            functions = EXCLUDED.functions
                 """).format(worker=self._t["worker"]),
-                {"id": worker_id, "name": name, "queue": ",".join(queues), "role": role, "meta": metadata},
+                {
+                    "id": worker_id,
+                    "name": name,
+                    "queue": ",".join(queues),
+                    "role": role,
+                    "meta": metadata,
+                    "functions": functions,
+                },
             )
 
     async def deregister(self, worker_id: str) -> None:
@@ -1229,6 +1246,7 @@ class WorkerRepository:
         limit: int,
         strategy: DequeueStrategy,
         lease_ttl: int = 300,
+        functions: list[str] | None = None,
     ) -> list[Job]:
         """Claim up to *limit* runnable jobs and give each attempt a lease.
 
@@ -1236,6 +1254,9 @@ class WorkerRepository:
         the attempt's execution row) and ``lease_expires_at = NOW() + TTL``, where the
         TTL is the job's ``heartbeat_secs`` or *lease_ttl*. Every later write for
         this attempt is fenced on that ``lease_id``.
+
+        With *functions*, only jobs for those functions are claimed (``None``: all).
+        Group concurrency still counts every function in the group.
 
         Only ``queued``/``scheduled`` jobs are claimed. A job whose worker died is
         recovered by the sweep, not stolen here, so attempts are counted in one place.
@@ -1258,6 +1279,7 @@ class WorkerRepository:
                         FROM {jobs}
                         WHERE queue = ANY(%(queues)s)
                           AND status IN ('queued', 'scheduled')
+                          AND (%(functions)s::text[] IS NULL OR function = ANY(%(functions)s::text[]))
                           AND scheduled_at <= NOW()
                           AND (expires_at IS NULL OR expires_at > NOW())
                           AND (
@@ -1286,7 +1308,14 @@ class WorkerRepository:
                     """
                     + JOB_COLS
                 ).format(jobs=self._t["jobs"], order_sql=order_sql),
-                {"queues": ordered_queues, "limit": limit, "wid": worker_id, "ttl": lease_ttl, **extra_params},
+                {
+                    "queues": ordered_queues,
+                    "limit": limit,
+                    "wid": worker_id,
+                    "ttl": lease_ttl,
+                    "functions": functions,
+                    **extra_params,
+                },
             )
             rows = await cur.fetchall()
             if not rows:

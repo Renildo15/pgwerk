@@ -200,3 +200,24 @@ class TestPurgeCommand:
         assert result.exit_code == 0, result.output
         assert "Purged 3 job(s)." in result.output
         fake.purge_jobs.assert_awaited_once_with(statuses=["failed", "queued"], older_than_days=7, queue="q")
+
+
+class TestWorkerFunctionOption:
+    def test_function_flags_are_passed_to_run(self, monkeypatch):
+        import sys
+
+        from unittest.mock import AsyncMock
+        from unittest.mock import MagicMock
+
+        fake = MagicMock()
+        fake.__aenter__ = AsyncMock(return_value=fake)
+        fake.__aexit__ = AsyncMock(return_value=None)
+        fake.run = AsyncMock()
+        monkeypatch.setattr(sys.modules["pgwerk.cli.worker"], "load_app", lambda _: fake)
+
+        result = CliRunner().invoke(cli, ["worker", "x:app", "-f", "m.a", "--function", "m.b"])
+        assert result.exit_code == 0, result.output
+        assert fake.run.await_args.kwargs["functions"] == ["m.a", "m.b"]
+
+        CliRunner().invoke(cli, ["worker", "x:app"])
+        assert fake.run.await_args.kwargs["functions"] is None

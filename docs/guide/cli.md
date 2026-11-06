@@ -43,6 +43,9 @@ werk worker myapp.tasks:app --worker-type thread --log-format json
 werk worker myapp.tasks:app --worker-type process --concurrency 4
 ```
 
+Use `-f/--function` (repeatable) to claim only jobs for those functions; see
+[Function routing](workers.md#function-routing).
+
 ### `werk info`
 
 Print queue statistics, active workers, and server information.

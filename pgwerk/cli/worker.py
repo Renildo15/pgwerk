@@ -33,9 +33,23 @@ from ..logging import configure_logging
     show_default=True,
     type=click.Choice(["text", "json"], case_sensitive=False),
 )
+@click.option(
+    "--function",
+    "-f",
+    "functions",
+    multiple=True,
+    help="Only claim jobs for this function (dotted path). Repeat for several. Default: all.",
+)
 @click.option("--no-color", is_flag=True, default=False, help="Disable colored log output.")
 def worker(
-    app: str, queues: str, concurrency: int, worker_type: str, log_level: str, log_format: str, no_color: bool
+    app: str,
+    queues: str,
+    concurrency: int,
+    worker_type: str,
+    log_level: str,
+    log_format: str,
+    no_color: bool,
+    functions: tuple[str, ...],
 ) -> None:
     """Start a worker process.
 
@@ -47,7 +61,12 @@ def worker(
 
     async def _run() -> None:
         async with wrk_app:
-            await wrk_app.run(queues=queue_list, concurrency=concurrency, worker_type=worker_type)
+            await wrk_app.run(
+                queues=queue_list,
+                concurrency=concurrency,
+                worker_type=worker_type,
+                functions=list(functions) or None,
+            )
 
     try:
         asyncio.run(_run())

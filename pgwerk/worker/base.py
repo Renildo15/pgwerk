@@ -22,6 +22,7 @@ import psycopg
 from psycopg.sql import SQL
 from psycopg.sql import Identifier
 
+from ..utils import fn_path
 from ..utils import call_hook
 from ..commons import JobStatus
 from ..commons import DequeueStrategy
@@ -62,6 +63,7 @@ class BaseWorker(abc.ABC):
         shutdown_timeout: float | None = None,
         listen: bool | None = None,
         maintenance: bool = True,
+        functions: list[str | Callable] | None = None,
     ) -> None:
         """Initialise the worker with scheduling and concurrency settings.
 
@@ -87,6 +89,10 @@ class BaseWorker(abc.ABC):
                 instant ``NOTIFY``-driven wake-up. Falls back to
                 ``app.config.listen``. Set to ``False`` when using PgBouncer
                 in transaction-pooling mode.
+            functions: Only claim jobs for these functions (callables or dotted
+                paths, matched exactly against the enqueued ``function``). ``None``
+                (default) claims every function on the worker's queues. Use it to
+                split one queue across deployments that can run different code.
             maintenance: Run the maintenance pass (sweep, stranded ``waiting``
                 job reconciliation, rescheduling) every ``sweep_interval``.
                 Set to ``False`` when ``wrk maintain`` or the API process
@@ -108,6 +114,11 @@ class BaseWorker(abc.ABC):
         self.shutdown_timeout = shutdown_timeout if shutdown_timeout is not None else app.config.shutdown_timeout
         self.listen = listen if listen is not None else app.config.listen
         self.maintenance = maintenance
+        if functions is not None and not functions:
+            raise ValueError("functions must not be empty; pass None to handle every function")
+        self.functions: list[str] | None = (
+            None if functions is None else [f if isinstance(f, str) else fn_path(f) for f in functions]
+        )
 
         self.id = uuid.uuid4().hex
         self.name = f"{socket.gethostname()}.{os.getpid()}"
@@ -267,8 +278,10 @@ class BaseWorker(abc.ABC):
                     "strategy": self.dequeue_strategy.value,
                     "worker_type": type(self).__name__,
                     "burst": self.burst,
+                    "functions": self.functions,
                 }
             ),
+            functions=self.functions,
         )
         logger.info("Worker %s registered (%s)", self.name, self.id)
 
@@ -504,6 +517,7 @@ class BaseWorker(abc.ABC):
                 limit=limit,
                 strategy=self.dequeue_strategy,
                 lease_ttl=self.app.config.local_lease_ttl,
+                functions=self.functions,
             )
         except Exception as exc:
             logger.error("Worker %s: dequeue error: %s", self.name, exc)

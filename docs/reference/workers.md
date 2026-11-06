@@ -22,6 +22,7 @@ BaseWorker(
     shutdown_timeout: float | None = None,
     listen: bool | None = None,
     maintenance: bool = True,
+    functions: list[str | Callable] | None = None,
 )
 ```
 
