@@ -46,6 +46,10 @@ dashboard:
 docs:
     uv run mkdocs serve
 
+# Regenerate the OpenAPI description of the remote-worker protocol
+openapi:
+    uv run python -m pgwerk.remote.server.openapi > docs/reference/remote-openapi.json
+
 # Build or deploy docs — pass `build` or `deploy`
 #   just build docs
 #   just deploy docs

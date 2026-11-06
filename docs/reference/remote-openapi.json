@@ -1,0 +1,848 @@
+{
+  "components": {
+    "schemas": {
+      "ClaimRequest": {
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "wait": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "claim_id"
+        ],
+        "title": "ClaimRequest",
+        "type": "object"
+      },
+      "ClaimResponse": {
+        "properties": {
+          "heartbeat_every": {
+            "type": "integer"
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobBody"
+          },
+          "lease_expires_at": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lease_id": {
+            "type": "string"
+          },
+          "lease_ttl": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "heartbeat_every",
+          "job",
+          "lease_id",
+          "lease_ttl"
+        ],
+        "title": "ClaimResponse",
+        "type": "object"
+      },
+      "ClientInfo": {
+        "properties": {
+          "lang": {
+            "default": "unknown",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "title": "ClientInfo",
+        "type": "object"
+      },
+      "CompleteRequest": {
+        "properties": {
+          "result": {}
+        },
+        "required": [],
+        "title": "CompleteRequest",
+        "type": "object"
+      },
+      "ErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorBody",
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "message": {
+            "default": "",
+            "type": "string"
+          },
+          "stack": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "ErrorDetail",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "FailRequest": {
+        "properties": {
+          "aborted": {
+            "default": false,
+            "type": "boolean"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retryable": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "title": "FailRequest",
+        "type": "object"
+      },
+      "FunctionDecl": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "FunctionDecl",
+        "type": "object"
+      },
+      "HeartbeatRequest": {
+        "properties": {
+          "progress": {}
+        },
+        "required": [],
+        "title": "HeartbeatRequest",
+        "type": "object"
+      },
+      "HeartbeatResponse": {
+        "properties": {
+          "abort": {
+            "type": "boolean"
+          },
+          "lease_expires_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "abort",
+          "lease_expires_at"
+        ],
+        "title": "HeartbeatResponse",
+        "type": "object"
+      },
+      "JobBody": {
+        "properties": {
+          "args": {
+            "items": {},
+            "type": "array"
+          },
+          "attempts": {
+            "type": "integer"
+          },
+          "function": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kwargs": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "lost_count": {
+            "type": "integer"
+          },
+          "max_attempts": {
+            "type": "integer"
+          },
+          "meta": {},
+          "queue": {
+            "type": "string"
+          },
+          "timeout_secs": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "args",
+          "attempts",
+          "function",
+          "id",
+          "kwargs",
+          "lost_count",
+          "max_attempts",
+          "meta",
+          "queue"
+        ],
+        "title": "JobBody",
+        "type": "object"
+      },
+      "Limits": {
+        "properties": {
+          "max_error_bytes": {
+            "type": "integer"
+          },
+          "max_payload_bytes": {
+            "type": "integer"
+          },
+          "max_result_bytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_error_bytes",
+          "max_payload_bytes",
+          "max_result_bytes"
+        ],
+        "title": "Limits",
+        "type": "object"
+      },
+      "RegisterRequest": {
+        "properties": {
+          "client": {
+            "$ref": "#/components/schemas/ClientInfo"
+          },
+          "functions": {
+            "items": {
+              "$ref": "#/components/schemas/FunctionDecl"
+            },
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "name": {
+            "default": "remote",
+            "type": "string"
+          },
+          "queues": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "functions",
+          "queues"
+        ],
+        "title": "RegisterRequest",
+        "type": "object"
+      },
+      "RegisterResponse": {
+        "properties": {
+          "claim_wait": {
+            "type": "integer"
+          },
+          "lease_ttl": {
+            "type": "integer"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "protocol": {
+            "type": "integer"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "worker_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "claim_wait",
+          "lease_ttl",
+          "limits",
+          "protocol",
+          "worker_id",
+          "worker_token"
+        ],
+        "title": "RegisterResponse",
+        "type": "object"
+      },
+      "ReportResponse": {
+        "properties": {
+          "retry_at": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ReportResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Protocol v1. Normative spec: docs/reference/remote-protocol.md.",
+    "title": "pgwerk remote workers",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/remote/v1/claim": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1ClaimClaim",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimResponse"
+                }
+              }
+            },
+            "description": "a job, leased to this worker"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Document created, URL follows",
+            "headers": {}
+          },
+          "204": {
+            "description": "nothing to claim within the wait, or a spent claim_id"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "draining"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "rate_limited"
+          }
+        },
+        "summary": "Long-poll for one job",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    },
+    "/remote/v1/deregister": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1DeregisterDeregister",
+        "responses": {
+          "204": {
+            "description": "Request fulfilled, nothing follows",
+            "headers": {}
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          }
+        },
+        "summary": "Stop this worker; jobs it holds go back to the queue",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    },
+    "/remote/v1/leases/{lease_id}/complete": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1LeasesLeaseIdCompleteComplete",
+        "parameters": [
+          {
+            "deprecated": false,
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/CompleteRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            },
+            "description": "Request fulfilled, document follows",
+            "headers": {}
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "lease_lost: drop the result"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          }
+        },
+        "summary": "Report success (idempotent per lease)",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    },
+    "/remote/v1/leases/{lease_id}/fail": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1LeasesLeaseIdFailFail",
+        "parameters": [
+          {
+            "deprecated": false,
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FailRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            },
+            "description": "Request fulfilled, document follows",
+            "headers": {}
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "lease_lost: drop the result"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          }
+        },
+        "summary": "Report failure or abort (idempotent per lease)",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    },
+    "/remote/v1/leases/{lease_id}/heartbeat": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1LeasesLeaseIdHeartbeatHeartbeat",
+        "parameters": [
+          {
+            "deprecated": false,
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/HeartbeatRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatResponse"
+                }
+              }
+            },
+            "description": "Request fulfilled, document follows",
+            "headers": {}
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "lease_lost: stop the job"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          }
+        },
+        "summary": "Renew a lease; learn whether the job was aborted",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    },
+    "/remote/v1/register": {
+      "post": {
+        "deprecated": false,
+        "operationId": "RemoteV1RegisterRegister",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterResponse"
+                }
+              }
+            },
+            "description": "Document created, URL follows",
+            "headers": {}
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "bad_request or protocol"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthorized: invalid, revoked or wrong kind of token (stop); session_expired: register again"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "scope"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "too_large"
+          }
+        },
+        "summary": "Exchange an enrollment token for a worker identity",
+        "tags": [
+          "remote workers v1"
+        ]
+      }
+    }
+  }
+}
