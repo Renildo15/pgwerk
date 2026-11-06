@@ -110,3 +110,50 @@ class TestFence:
         [execution] = await app.get_executions(job.id)
         assert execution.status.value == "failed"
         assert execution.error == "boom"
+
+
+class TestCallbackSeesSettledJob:
+    """Callbacks get the job as settled (final status, error or result), not as claimed."""
+
+    @pytest.fixture(autouse=True)
+    def _clear(self):
+        from .tasks import _callback_jobs
+
+        _callback_jobs.clear()
+        yield
+        _callback_jobs.clear()
+
+    async def test_on_success_sees_status_and_result(self, app):
+        from .tasks import capture_job
+        from .tasks import _callback_jobs
+
+        job, fence = await _claim(app, _on_success=capture_job)
+        await app._settlement.settle(job, fence, Outcome("complete", result_json='{"n": 7}'))
+        [seen] = _callback_jobs
+        assert (seen.status, seen.result) == (JobStatus.Complete, {"n": 7})
+
+    async def test_on_failure_sees_status_and_error(self, app):
+        from .tasks import capture_job
+        from .tasks import _callback_jobs
+
+        job, fence = await _claim(app, _on_failure=capture_job)
+        await app._settlement.settle(job, fence, Outcome("fail", error="boom", retryable=False))
+        [seen] = _callback_jobs
+        assert (seen.status, seen.error) == (JobStatus.Failed, "boom")
+
+    async def test_on_stopped_of_an_expired_job_sees_expired(self, app):
+        from .tasks import noop
+        from .tasks import capture_job
+        from .tasks import _callback_jobs
+
+        job = await app.enqueue(noop, _ttl=60, _on_stopped=capture_job)
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("UPDATE {jobs} SET expires_at = NOW() - INTERVAL '1 second' WHERE id = %s").format(
+                    jobs=app._t["jobs"]
+                ),
+                (job.id,),
+            )
+        await app.expire_unstarted()
+        [seen] = _callback_jobs
+        assert (seen.status, seen.error) == (JobStatus.Aborted, "expired")

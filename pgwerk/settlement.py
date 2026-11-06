@@ -11,6 +11,7 @@ callback after commit.
 from __future__ import annotations
 
 import logging
+import dataclasses
 
 from typing import TYPE_CHECKING
 from typing import Any
@@ -25,6 +26,7 @@ from psycopg.rows import dict_row
 from .utils import invoke_callback
 from .commons import JobStatus
 from .schemas import Job
+from .serializers import decode
 
 
 if TYPE_CHECKING:
@@ -257,12 +259,21 @@ class Settlement:
             await self.run_callback(job, settled)
         return settled
 
-    @staticmethod
-    async def run_callback(job: Job, settled: Settled) -> None:
-        """Run the callback chosen for a settled job, if any. Never raises."""
+    async def run_callback(self, job: Job, settled: Settled) -> None:
+        """Run the callback chosen for a settled job, if any. Never raises.
+
+        The callback gets the job as it was settled: its final ``status``, and its
+        ``error`` (``"expired"``, ``"lease_lost"``, ``"timeout"``, a traceback...) or,
+        on success, its ``result``. It doesn't get the job as it was when claimed.
+        """
         t = settled.transition
         if t is not None and t.callback:
-            await invoke_callback(t.callback, job, timeout=t.callback_timeout)
+            await invoke_callback(t.callback, self._settled_view(job, t), timeout=t.callback_timeout)
+
+    def _settled_view(self, job: Job, t: Transition) -> Job:
+        if t.status == JobStatus.Complete:
+            return dataclasses.replace(job, status=t.status, result=decode(self._jobs._serializer, t.result_json))
+        return dataclasses.replace(job, status=t.status, error=t.error)
 
     async def sweep(self, max_active_secs: int) -> list[str]:
         """Recover stuck jobs whose worker stopped making progress.

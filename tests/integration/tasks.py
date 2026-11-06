@@ -272,3 +272,11 @@ def block_and_record(ctx, label: str = "block", seconds_after_release: float = 0
         time.sleep(seconds_after_release)
     _side_effect_log.append((label, ctx.job.attempts, ctx.worker.id))
     return {"label": label, "attempt": ctx.job.attempts, "worker_id": ctx.worker.id}
+
+
+# Callbacks that keep the Job object they receive, to check what callbacks see.
+_callback_jobs: list = []
+
+
+def capture_job(job) -> None:
+    _callback_jobs.append(job)

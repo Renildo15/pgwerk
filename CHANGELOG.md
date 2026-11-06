@@ -30,6 +30,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - A job the sweep fails at its attempt cap (`error = 'swept'`) now goes through the same settlement as any other failure: `on_failure` runs, `failure_mode="delete"` deletes it after settling dependents, and `failure_ttl` sets `expires_at`. Previously none of these applied. The callback runs in the process that ran the sweep, so the callback's module must be importable there.
 - The next run of a repeating job is inserted in the same transaction that marks the current run complete. Previously it was inserted afterwards, and a crash in between ended the repeat chain.
 - The execution row of a `_sync=True` job is now closed when the job finishes. It has no worker id, and settling matched execution rows by worker, so it stayed `running`.
+- Callbacks (`on_success`, `on_failure`, `on_stopped`) receive the job as it was settled: its final `status` and its `error` (such as `"expired"`, `"timeout"` or the traceback) or, on success, its `result`. Previously they received the job as it was when claimed, with the previous status and error.
 - Repeated runs keep the job's `failure_mode`. Previously every run after the first fell back to `hold`.
 - A handler that raises while an abort is pending now ends `aborted` (running `on_stopped`), the same as a handler that returns. Previously the failure could requeue it for a retry, undoing the abort.
 
