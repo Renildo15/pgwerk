@@ -130,7 +130,7 @@ class Waiters:
                 raise
             except Exception as exc:
                 if not self._running:
-                    return
+                    return  # type: ignore[unreachable]
                 logger.warning("remote long-poll listener error, reconnecting in %.1fs: %s", backoff, exc)
                 # Wake everyone: notifications may have been missed while disconnected.
                 for queue in list(self._waiting):
