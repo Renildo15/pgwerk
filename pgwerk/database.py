@@ -49,6 +49,19 @@ class DatabaseManager:
             return Identifier(f"{p}_{name}")
 
         return [
+            # --- enrollment tokens (remote workers) ---------------------------
+            SQL("""
+                CREATE TABLE IF NOT EXISTS {enrollment_tokens} (
+                    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name         TEXT        NOT NULL,
+                    secret_hash  BYTEA       NOT NULL,
+                    queues       TEXT[]      NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at   TIMESTAMPTZ,
+                    last_used_at TIMESTAMPTZ,
+                    revoked_at   TIMESTAMPTZ
+                )
+            """).format(enrollment_tokens=t("enrollment_tokens")),
             # --- worker -------------------------------------------------------
             SQL(
                 "CREATE {unlogged}TABLE IF NOT EXISTS {worker} ("
@@ -61,9 +74,11 @@ class DatabaseManager:
                 "    metadata     JSONB,"
                 "    heartbeat_at TIMESTAMPTZ,"
                 "    expires_at   TIMESTAMPTZ,"
-                "    functions    TEXT[]"
+                "    functions    TEXT[],"
+                "    session_hash BYTEA,"
+                "    enrollment_token_id UUID REFERENCES {enrollment_tokens}(id)"
                 ")"
-            ).format(unlogged=unlogged, worker=t("worker")),
+            ).format(unlogged=unlogged, worker=t("worker"), enrollment_tokens=t("enrollment_tokens")),
             SQL("CREATE INDEX IF NOT EXISTS {idx} ON {worker} (queue, status)").format(
                 idx=idx("worker_queue_status_idx"), worker=t("worker")
             ),
@@ -187,7 +202,9 @@ class DatabaseManager:
                     attempt      INT         NOT NULL DEFAULT 1,
                     status       TEXT        NOT NULL DEFAULT 'running',
                     error        TEXT,
-                    result       JSONB
+                    result       JSONB,
+                    claim_id     UUID,
+                    progress     JSONB
                 )
             """).format(
                 executions=t("jobs_executions"),
@@ -197,6 +214,10 @@ class DatabaseManager:
             SQL("CREATE INDEX IF NOT EXISTS {idx} ON {executions} (job_id)").format(
                 idx=idx("executions_job_id_idx"), executions=t("jobs_executions")
             ),
+            # A remote worker's claim id: a retried claim gets the same lease back.
+            SQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {executions} (claim_id) WHERE claim_id IS NOT NULL"
+            ).format(idx=idx("executions_claim_idx"), executions=t("jobs_executions")),
             # --- job_deps -----------------------------------------------------
             SQL("""
                 CREATE TABLE IF NOT EXISTS {deps} (
@@ -392,6 +413,39 @@ class DatabaseManager:
                             last_registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                         )
                     """).format(functions=t("functions")),
+                ],
+            ),
+            (
+                10,
+                [
+                    # Remote workers: enrollment tokens, worker sessions, claim replay, progress.
+                    SQL("""
+                        CREATE TABLE IF NOT EXISTS {enrollment_tokens} (
+                            id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+                            name         TEXT        NOT NULL,
+                            secret_hash  BYTEA       NOT NULL,
+                            queues       TEXT[]      NOT NULL,
+                            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            expires_at   TIMESTAMPTZ,
+                            last_used_at TIMESTAMPTZ,
+                            revoked_at   TIMESTAMPTZ
+                        )
+                    """).format(enrollment_tokens=t("enrollment_tokens")),
+                    SQL("ALTER TABLE {worker} ADD COLUMN IF NOT EXISTS session_hash BYTEA").format(worker=t("worker")),
+                    SQL(
+                        "ALTER TABLE {worker} ADD COLUMN IF NOT EXISTS enrollment_token_id UUID "
+                        "REFERENCES {enrollment_tokens}(id)"
+                    ).format(worker=t("worker"), enrollment_tokens=t("enrollment_tokens")),
+                    SQL("ALTER TABLE {executions} ADD COLUMN IF NOT EXISTS claim_id UUID").format(
+                        executions=t("jobs_executions")
+                    ),
+                    SQL("ALTER TABLE {executions} ADD COLUMN IF NOT EXISTS progress JSONB").format(
+                        executions=t("jobs_executions")
+                    ),
+                    SQL(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {executions} (claim_id) "
+                        "WHERE claim_id IS NOT NULL"
+                    ).format(idx=idx("executions_claim_idx"), executions=t("jobs_executions")),
                 ],
             ),
         ]

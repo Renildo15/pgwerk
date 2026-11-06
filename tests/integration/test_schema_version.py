@@ -217,3 +217,48 @@ class TestMigrationV9:
                         "functions",
                     ):
                         await conn.execute(f'DROP TABLE IF EXISTS "{_TEST_SCHEMA}"."{prefix}_{tbl}" CASCADE')
+
+
+class TestMigrationV10:
+    """A schema-9 database migrated to 10 must match a fresh install."""
+
+    @pytest.mark.asyncio
+    async def test_v9_to_v10_matches_fresh_install(self):
+        fresh, migrated = "_mig10_fresh", "_mig10_v9"
+        s = _TEST_SCHEMA
+        async with await psycopg.AsyncConnection.connect(_TEST_DSN, autocommit=True) as conn:
+            try:
+                for prefix in (fresh, migrated):
+                    app = Werk(_TEST_DSN, prefix=prefix)
+                    await app.connect()
+                    await app.disconnect()
+
+                # Roll the second install back to schema 9: drop what migration 10 adds.
+                await conn.execute(f'ALTER TABLE "{s}"."{migrated}_worker" DROP COLUMN session_hash')
+                await conn.execute(f'ALTER TABLE "{s}"."{migrated}_worker" DROP COLUMN enrollment_token_id')
+                await conn.execute(f'ALTER TABLE "{s}"."{migrated}_jobs_executions" DROP COLUMN claim_id')
+                await conn.execute(f'ALTER TABLE "{s}"."{migrated}_jobs_executions" DROP COLUMN progress')
+                await conn.execute(f'DROP TABLE "{s}"."{migrated}_enrollment_tokens"')
+                await conn.execute(f'UPDATE "{s}"."{migrated}_versions" SET version = 9')
+
+                app = Werk(_TEST_DSN, prefix=migrated)
+                await app.connect()
+                await app.disconnect()
+
+                cur = await conn.execute(f'SELECT version FROM "{s}"."{migrated}_versions"')
+                assert (await cur.fetchone())[0] == WerkConfig.schema_version
+                assert await _columns_and_indexes(conn, s, migrated) == await _columns_and_indexes(conn, s, fresh)
+            finally:
+                for prefix in (fresh, migrated):
+                    for tbl in (
+                        "job_deps",
+                        "worker_jobs",
+                        "jobs_executions",
+                        "jobs",
+                        "schedules",
+                        "worker",
+                        "versions",
+                        "functions",
+                        "enrollment_tokens",
+                    ):
+                        await conn.execute(f'DROP TABLE IF EXISTS "{s}"."{prefix}_{tbl}" CASCADE')

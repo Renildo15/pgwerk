@@ -19,7 +19,7 @@ _TEST_SCHEMA = "pgwerk"
 _TEST_PREFIX = "_pgwerk"
 
 _TABLES = ["job_deps", "worker_jobs", "jobs_executions", "jobs", "schedules", "functions"]
-_DROP_TABLES = [*_TABLES, "worker", "versions"]
+_DROP_TABLES = [*_TABLES, "worker", "versions", "enrollment_tokens"]
 
 
 @pytest.fixture(scope="session", autouse=True)

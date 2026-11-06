@@ -57,6 +57,19 @@ class WerkConfig:
         purge_expired: Let maintenance delete finished jobs whose ``_result_ttl``
             or ``_failure_ttl`` ran out (and stopped worker rows past their
             expiry). Set ``False`` to keep every row.
+        remote_workers: Serve the remote-worker protocol at ``/remote/v1`` from the API
+            process (experimental). Requires ``api_token`` (or ``api=False``) and the
+            JSON serializer, and turns maintenance on unless it's explicitly off.
+        api: Serve the admin REST API at ``/api``. Turn it off to run a process that
+            only serves remote workers.
+        remote_claim_wait: Seconds a remote ``claim`` long-poll is held open.
+        remote_claim_rate: Claims per second allowed per remote worker (token bucket,
+            per server replica), with bursts up to ``remote_claim_burst``.
+        remote_claim_burst: Bucket size for ``remote_claim_rate``.
+        remote_max_payload_bytes: Largest request body accepted (256 KiB).
+        remote_max_result_bytes: Largest ``complete`` body accepted (1 MiB).
+        remote_max_error_bytes: Longest error stored from a remote ``fail``; longer
+            errors are truncated, not rejected (64 KiB).
         local_lease_ttl: Seconds a local worker's claim on a job stays valid without
             renewal, for jobs without ``heartbeat_secs`` (which is used instead). If
             the worker stops renewing, the sweep recovers the job after this long.
@@ -69,11 +82,11 @@ class WerkConfig:
             than retrying immediately. An explicit :class:`Retry` always wins.
     """
 
-    schema_version: ClassVar[int] = 9
+    schema_version: ClassVar[int] = 10
     # This build reads and writes the columns its own schema adds, so it refuses an
     # older database instead of failing on its first query. Workers older than schema 8
     # are unaffected: what they accept is set by their own max (unbounded up to 0.1.26).
-    min_compatible_db_version: ClassVar[int] = 9
+    min_compatible_db_version: ClassVar[int] = 10
     # From schema 8 on, every release declares the newest schema it tolerates, so a
     # later breaking migration can stop older code from running against it. It covers
     # the additive migrations already planned (9: function routing, 10: remote
@@ -120,6 +133,16 @@ class WerkConfig:
     # Maintenance
     purge_expired: bool = True
 
+    # Remote workers (experimental)
+    remote_workers: bool = False
+    api: bool = True
+    remote_claim_wait: int = 30
+    remote_claim_rate: float = 5.0
+    remote_claim_burst: int = 10
+    remote_max_payload_bytes: int = 256 * 1024
+    remote_max_result_bytes: int = 1024 * 1024
+    remote_max_error_bytes: int = 64 * 1024
+
     # Leases
     local_lease_ttl: int = 300
     remote_lease_ttl: int = 60
@@ -161,6 +184,14 @@ class WerkConfig:
             maintenance=_bool("PGWERK_MAINTENANCE", False),
             default_retry_backoff=_bool("PGWERK_DEFAULT_RETRY_BACKOFF", True),
             purge_expired=_bool("PGWERK_PURGE_EXPIRED", True),
+            remote_workers=_bool("PGWERK_REMOTE_WORKERS", False),
+            api=not _bool("PGWERK_NO_API", False),
+            remote_claim_wait=_int("PGWERK_REMOTE_CLAIM_WAIT", 30),
+            remote_claim_rate=_float("PGWERK_REMOTE_CLAIM_RATE", 5.0),
+            remote_claim_burst=_int("PGWERK_REMOTE_CLAIM_BURST", 10),
+            remote_max_payload_bytes=_int("PGWERK_REMOTE_MAX_PAYLOAD_BYTES", 256 * 1024),
+            remote_max_result_bytes=_int("PGWERK_REMOTE_MAX_RESULT_BYTES", 1024 * 1024),
+            remote_max_error_bytes=_int("PGWERK_REMOTE_MAX_ERROR_BYTES", 64 * 1024),
             local_lease_ttl=_int("PGWERK_LOCAL_LEASE_TTL", 300),
             remote_lease_ttl=_int("PGWERK_REMOTE_LEASE_TTL", 60),
             default_max_lost=_int("PGWERK_DEFAULT_MAX_LOST", 3),
@@ -191,6 +222,14 @@ class WerkConfig:
         os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
         os.environ["PGWERK_DEFAULT_RETRY_BACKOFF"] = "true" if self.default_retry_backoff else "false"
         os.environ["PGWERK_PURGE_EXPIRED"] = "true" if self.purge_expired else "false"
+        os.environ["PGWERK_REMOTE_WORKERS"] = "true" if self.remote_workers else "false"
+        os.environ["PGWERK_NO_API"] = "true" if not self.api else "false"
+        os.environ["PGWERK_REMOTE_CLAIM_WAIT"] = str(self.remote_claim_wait)
+        os.environ["PGWERK_REMOTE_CLAIM_RATE"] = str(self.remote_claim_rate)
+        os.environ["PGWERK_REMOTE_CLAIM_BURST"] = str(self.remote_claim_burst)
+        os.environ["PGWERK_REMOTE_MAX_PAYLOAD_BYTES"] = str(self.remote_max_payload_bytes)
+        os.environ["PGWERK_REMOTE_MAX_RESULT_BYTES"] = str(self.remote_max_result_bytes)
+        os.environ["PGWERK_REMOTE_MAX_ERROR_BYTES"] = str(self.remote_max_error_bytes)
         os.environ["PGWERK_LOCAL_LEASE_TTL"] = str(self.local_lease_ttl)
         os.environ["PGWERK_REMOTE_LEASE_TTL"] = str(self.remote_lease_ttl)
         os.environ["PGWERK_DEFAULT_MAX_LOST"] = str(self.default_max_lost)

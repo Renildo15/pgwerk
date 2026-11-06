@@ -115,6 +115,7 @@ class Werk:
             "deps": self._db.table("job_deps"),
             "schedules": self._db.table("schedules"),
             "functions": self._db.table("functions"),
+            "enrollment_tokens": self._db.table("enrollment_tokens"),
         }
 
         self.__job_repo: JobRepository | None = None
@@ -1241,9 +1242,11 @@ class Werk:
         async with await self._connect() as conn:
             await conn.execute(
                 SQL("""
-                    TRUNCATE {jobs}, {executions}, {worker}, {worker_jobs}, {deps}, {schedules}, {functions}
+                    TRUNCATE {jobs}, {executions}, {worker}, {worker_jobs}, {deps}, {schedules}, {functions},
+                             {enrollment_tokens}
                     RESTART IDENTITY CASCADE
                 """).format(
+                    enrollment_tokens=self._t["enrollment_tokens"],
                     functions=self._t["functions"],
                     jobs=self._t["jobs"],
                     executions=self._t["executions"],
