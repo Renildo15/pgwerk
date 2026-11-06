@@ -114,7 +114,6 @@ class TestConnectVersionGate:
         assert observer._connected is False
 
 
-
 async def _columns_and_indexes(conn, schema: str, prefix: str) -> tuple[set, set]:
     cur = await conn.execute(
         """
@@ -158,11 +157,63 @@ class TestMigrationV8:
                 await app.disconnect()
 
                 cur = await conn.execute(f'SELECT version FROM "{_TEST_SCHEMA}"."{migrated}_versions"')
-                assert (await cur.fetchone())[0] == 8
+                assert (await cur.fetchone())[0] == WerkConfig.schema_version
                 assert await _columns_and_indexes(conn, _TEST_SCHEMA, migrated) == await _columns_and_indexes(
                     conn, _TEST_SCHEMA, fresh
                 )
             finally:
                 for prefix in (fresh, migrated):
-                    for tbl in ("job_deps", "worker_jobs", "jobs_executions", "jobs", "schedules", "worker", "versions"):
+                    for tbl in (
+                        "job_deps",
+                        "worker_jobs",
+                        "jobs_executions",
+                        "jobs",
+                        "schedules",
+                        "worker",
+                        "versions",
+                        "functions",
+                    ):
+                        await conn.execute(f'DROP TABLE IF EXISTS "{_TEST_SCHEMA}"."{prefix}_{tbl}" CASCADE')
+
+
+class TestMigrationV9:
+    """A schema-8 database migrated to 9 must match a fresh install."""
+
+    @pytest.mark.asyncio
+    async def test_v8_to_v9_matches_fresh_install(self):
+        fresh, migrated = "_mig9_fresh", "_mig9_v8"
+        async with await psycopg.AsyncConnection.connect(_TEST_DSN, autocommit=True) as conn:
+            try:
+                for prefix in (fresh, migrated):
+                    app = Werk(_TEST_DSN, prefix=prefix)
+                    await app.connect()
+                    await app.disconnect()
+
+                # Roll the second install back to schema 8: drop what migration 9 adds.
+                await conn.execute(f'ALTER TABLE "{_TEST_SCHEMA}"."{migrated}_worker" DROP COLUMN functions')
+                await conn.execute(f'DROP INDEX "{_TEST_SCHEMA}"."{migrated}_jobs_queue_function_idx"')
+                await conn.execute(f'DROP TABLE "{_TEST_SCHEMA}"."{migrated}_functions"')
+                await conn.execute(f'UPDATE "{_TEST_SCHEMA}"."{migrated}_versions" SET version = 8')
+
+                app = Werk(_TEST_DSN, prefix=migrated)
+                await app.connect()
+                await app.disconnect()
+
+                cur = await conn.execute(f'SELECT version FROM "{_TEST_SCHEMA}"."{migrated}_versions"')
+                assert (await cur.fetchone())[0] == WerkConfig.schema_version
+                assert await _columns_and_indexes(conn, _TEST_SCHEMA, migrated) == await _columns_and_indexes(
+                    conn, _TEST_SCHEMA, fresh
+                )
+            finally:
+                for prefix in (fresh, migrated):
+                    for tbl in (
+                        "job_deps",
+                        "worker_jobs",
+                        "jobs_executions",
+                        "jobs",
+                        "schedules",
+                        "worker",
+                        "versions",
+                        "functions",
+                    ):
                         await conn.execute(f'DROP TABLE IF EXISTS "{_TEST_SCHEMA}"."{prefix}_{tbl}" CASCADE')

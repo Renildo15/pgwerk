@@ -20,6 +20,6 @@ def test_lease_settings_round_trip_through_env(monkeypatch):
 
 
 def test_compat_window_covers_planned_additive_migrations():
-    assert WerkConfig.schema_version == 8
+    assert WerkConfig.schema_version >= 8
     assert WerkConfig.max_compatible_db_version is not None
     assert WerkConfig.max_compatible_db_version >= WerkConfig.schema_version

@@ -60,7 +60,8 @@ class DatabaseManager:
                 "    role         TEXT        NOT NULL DEFAULT 'worker',"
                 "    metadata     JSONB,"
                 "    heartbeat_at TIMESTAMPTZ,"
-                "    expires_at   TIMESTAMPTZ"
+                "    expires_at   TIMESTAMPTZ,"
+                "    functions    TEXT[]"
                 ")"
             ).format(unlogged=unlogged, worker=t("worker")),
             SQL("CREATE INDEX IF NOT EXISTS {idx} ON {worker} (queue, status)").format(
@@ -148,6 +149,19 @@ class DatabaseManager:
             SQL("CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (expires_at) WHERE expires_at IS NOT NULL").format(
                 idx=idx("jobs_expires_at_idx"), jobs=t("jobs")
             ),
+            # Partial index — dequeue for workers that declare the functions they handle
+            SQL(
+                "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (queue, function, priority DESC, scheduled_at) "
+                "WHERE status IN ('queued', 'scheduled')"
+            ).format(idx=idx("jobs_queue_function_idx"), jobs=t("jobs")),
+            # --- functions (informational catalog) ----------------------------
+            SQL("""
+                CREATE TABLE IF NOT EXISTS {functions} (
+                    name               TEXT        PRIMARY KEY,
+                    languages          TEXT[]      NOT NULL DEFAULT '{{}}',
+                    last_registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """).format(functions=t("functions")),
             # --- worker_jobs --------------------------------------------------
             SQL(
                 "CREATE {unlogged}TABLE IF NOT EXISTS {worker_jobs} ("
@@ -358,6 +372,26 @@ class DatabaseManager:
                     SQL(
                         "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (expires_at) WHERE expires_at IS NOT NULL"
                     ).format(idx=idx("jobs_expires_at_idx"), jobs=t("jobs")),
+                ],
+            ),
+            (
+                9,
+                [
+                    # Function routing: a worker may declare the functions it handles
+                    # (NULL = all of them, as before).
+                    SQL("ALTER TABLE {worker} ADD COLUMN IF NOT EXISTS functions TEXT[]").format(worker=t("worker")),
+                    SQL(
+                        "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (queue, function, priority DESC, scheduled_at) "
+                        "WHERE status IN ('queued', 'scheduled')"
+                    ).format(idx=idx("jobs_queue_function_idx"), jobs=t("jobs")),
+                    # Informational catalog of registered functions; nothing at enqueue reads it.
+                    SQL("""
+                        CREATE TABLE IF NOT EXISTS {functions} (
+                            name               TEXT        PRIMARY KEY,
+                            languages          TEXT[]      NOT NULL DEFAULT '{{}}',
+                            last_registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """).format(functions=t("functions")),
                 ],
             ),
         ]
