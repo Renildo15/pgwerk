@@ -30,6 +30,7 @@ nav:
     - Schemas: reference/schemas.md
     - Exceptions: reference/exceptions.md
     - Remote workers: reference/remote.md
+    - Remote protocol v1: reference/remote-protocol.md
   - Changelog: changelog.md
 
 markdown_extensions:

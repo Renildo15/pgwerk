@@ -123,39 +123,15 @@ the URL's lifetime.
 
 ## Protocol v1
 
-JSON over HTTPS under `/remote/v1`. Every request sends `Pgwerk-Protocol: 1` and
-`Authorization: Bearer <token>`: the enrollment token for `register`, the worker token for the rest.
+The protocol is specified in [Remote worker protocol v1](remote-protocol.md), and
+[`remote-openapi.json`](remote-openapi.json) is its OpenAPI description. Each endpoint is a `POST`
+under `/remote/v1`:
 
-| Endpoint | Body | Response |
+| Endpoint | Token | Purpose |
 |---|---|---|
-| `POST /register` | `{name, queues, functions: [{name}], labels?, client: {lang, version}}` | `201 {worker_id, worker_token, protocol, lease_ttl, claim_wait, limits}` |
-| `POST /claim` | `{claim_id, wait?}` | `200 {job, lease_id, lease_expires_at, lease_ttl, heartbeat_every}` or `204` |
-| `POST /leases/{lease_id}/heartbeat` | `{progress?}` | `200 {lease_expires_at, abort}` |
-| `POST /leases/{lease_id}/complete` | `{result}` | `200 {status}` |
-| `POST /leases/{lease_id}/fail` | `{error: {type, message, stack?}, retryable?, aborted?}` | `200 {status, retry_at?}` |
-| `POST /deregister` | none | `204` |
-
-- **`claim`:**
-  - It long-polls up to `wait` seconds (server maximum 30); use a client timeout of at least 40s.
-  - Send a fresh `claim_id` (UUID) per claim and reuse it when retrying that claim: a lost response
-    returns the same lease. Once that attempt is over, the id gets `204`.
-  - `job` has `id`, `function`, `queue`, `kwargs`, `args`, `attempts`, `max_attempts`,
-    `lost_count`, `timeout_secs` and `meta`. `kwargs` is the cross-language contract. A non-Python client should
-    fail a job with non-empty `args` with `retryable: false`.
-- **`heartbeat`:** send it every `heartbeat_every` seconds. `abort: true` means stop the job and report
-  `fail` with `aborted: true`.
-- **`complete`/`fail`:**
-  - They are idempotent per lease: repeating one returns the same `status`, and `settled` means the
-    job no longer exists.
-  - Retry on network errors, `429` and `5xx` for at least `lease_ttl`.
-- **Errors:** they look like `{"error": {"code", "message"}}`. Branch on `code`:
-
-  | Code | Status | What the client does |
-  |---|---|---|
-  | `lease_lost` | 409 | Stop the job and drop its result: another attempt owns it. |
-  | `draining` | 403 | Claim nothing new, finish the jobs held, then `deregister`. |
-  | `unauthorized` | 401 | The token is invalid, revoked or expired. Register again, or stop. |
-  | `scope` | 403 | Queues or functions are outside the token's scope. |
-  | `too_large` | 413 | Report a `complete` that is too big as `fail` with `retryable: false`. |
-  | `rate_limited` | 429 | Back off. |
-  | `protocol` | 400 | The `Pgwerk-Protocol` header is missing or wrong. |
+| `register` | enrollment | Get a worker identity and token |
+| `claim` | worker | Long-poll for one job; reuse `claim_id` when retrying |
+| `leases/{id}/heartbeat` | worker | Renew the lease; learn about aborts |
+| `leases/{id}/complete` | worker | Report a result (idempotent) |
+| `leases/{id}/fail` | worker | Report an error or an abort (idempotent) |
+| `deregister` | worker | Leave; held jobs go back to the queue |
