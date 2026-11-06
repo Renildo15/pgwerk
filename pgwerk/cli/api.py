@@ -39,7 +39,7 @@ from ..logging import configure_logging
     is_flag=True,
     default=False,
     envvar="PGWERK_REMOTE_WORKERS",
-    help="Serve the remote-worker protocol at /remote/v1 (experimental). Requires --api-token or --no-api.",
+    help="Serve the remote-worker protocol at /remote/v1. Requires --api-token or --no-api.",
 )
 @click.option(
     "--no-api",

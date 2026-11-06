@@ -62,7 +62,7 @@ class WerkConfig:
             or ``_failure_ttl`` ran out (and stopped worker rows past their
             expiry). Set ``False`` to keep every row.
         remote_workers: Serve the remote-worker protocol at ``/remote/v1`` from the API
-            process (experimental). Requires ``api_token`` (or ``api=False``) and the
+            process. Requires ``api_token`` (or ``api=False``) and the
             JSON serializer, and turns maintenance on unless it's explicitly off.
         api: Serve the admin REST API at ``/api``. Turn it off to run a process that
             only serves remote workers.
@@ -145,7 +145,7 @@ class WerkConfig:
     # Maintenance
     purge_expired: bool = True
 
-    # Remote workers (experimental)
+    # Remote workers
     remote_workers: bool = False
     api: bool = True
     remote_claim_wait: int = 30

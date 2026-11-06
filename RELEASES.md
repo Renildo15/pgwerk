@@ -74,3 +74,21 @@ table, new index), bump `schema_version` but leave `min` where it is.
 This is the case where `min < schema_version` pays off — older API pods
 can keep running through a rolling deploy because they don't depend on
 the new column or table.
+
+## Remote worker protocol
+
+The remote-worker protocol (`/remote/v1`, specified in
+[`docs/reference/remote-protocol.md`](./docs/reference/remote-protocol.md)) has its own version,
+independent of the library version:
+
+- **Within a protocol version, changes are additive only**: new optional request fields, new response
+  fields, new endpoints and new error codes. Existing clients keep working. A test fails if the wire
+  format changes without `docs/reference/remote-openapi.json` being regenerated in the same change.
+- **A breaking change is a new version** (`/remote/v2`). A release that introduces v2 keeps serving
+  v1 for **at least two minor releases** after it.
+- The conformance suites in `conformance/` define what "compatible" means for servers and clients.
+
+| Library | Protocol | Notes |
+|---|---|---|
+| 0.4.0 | v1 (experimental) | First remote-worker release; the wire format may still change |
+| 0.5.0 | v1 (stable) | Normative spec, OpenAPI, conformance suites; the policy above applies |

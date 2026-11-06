@@ -1,7 +1,9 @@
-# Remote workers (experimental)
+# Remote workers
 
-!!! warning "Experimental"
-    The remote-worker protocol (`/remote/v1`) may still change without a version bump.
+!!! note "Protocol v1 is stable"
+    Within v1 (`/remote/v1`), changes are additive only. A breaking change will be a new version,
+    and v1 will keep being served for at least two minor releases after it. See
+    [Remote worker protocol v1](remote-protocol.md).
 
 A remote worker runs away from the database. It only needs outbound HTTPS to a pgwerk server,
 which keeps Postgres private. Use it for capacity you don't fully control: a GPU box in someone's

@@ -12,7 +12,7 @@ to acknowledge reports within a few working days.
 Security fixes go into the latest release. pgwerk is beta (0.x); upgrade to the latest version to
 receive fixes.
 
-## Threat model: remote workers (experimental)
+## Threat model: remote workers
 
 When `werk api --remote-workers` is on, the server faces the internet and talks to workers that
 pgwerk does **not** trust:

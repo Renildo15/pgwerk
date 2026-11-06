@@ -36,7 +36,7 @@ def _with_werk(f: Callable) -> Callable:
 
 @click.group()
 def token() -> None:
-    """Enrollment tokens that let remote workers register (experimental)."""
+    """Enrollment tokens that let remote workers register."""
 
 
 @token.command("create")
@@ -95,7 +95,7 @@ async def token_revoke(werk: Any, token_id: str) -> None:
 
 @click.group()
 def workers() -> None:
-    """Manage registered remote workers (experimental)."""
+    """Manage registered remote workers."""
 
 
 @workers.command("revoke")

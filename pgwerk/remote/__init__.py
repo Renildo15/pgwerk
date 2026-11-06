@@ -1,6 +1,7 @@
 """Remote workers: workers that reach pgwerk over HTTPS instead of connecting to Postgres.
 
-Experimental: the protocol (``/remote/v1``) may still change without a version bump.
+Protocol v1 (``/remote/v1``) is stable: within v1, changes are additive only. See
+``docs/reference/remote-protocol.md``.
 The client needs ``httpx`` (``pip install 'pgwerk[remote]'``) and is imported lazily, so
 the server side doesn't require it.
 """

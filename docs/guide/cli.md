@@ -169,7 +169,7 @@ importable.
 
 ### `werk token` / `werk workers`
 
-Manage remote-worker access (experimental); see [Remote workers](../reference/remote.md).
+Manage remote-worker access; see [Remote workers](../reference/remote.md).
 
 ```bash
 werk token create --dsn "$DSN" --name gpu-box-1 --queues render   # printed once
@@ -191,5 +191,5 @@ werk api --dsn "$DSN" --api-token "$ADMIN_TOKEN"
 |---|---|
 | `--api-token` | Bearer token for `/api` |
 | `--maintenance / --no-maintenance` | Run the maintenance pass in this process (default: on with `--remote-workers`) |
-| `--remote-workers` | Serve the remote-worker protocol at `/remote/v1` (experimental; needs `--api-token` or `--no-api`) |
+| `--remote-workers` | Serve the remote-worker protocol at `/remote/v1` (needs `--api-token` or `--no-api`) |
 | `--no-api` | Serve only the remote router: no `/api`, no dashboard |
