@@ -93,3 +93,43 @@ class TestWerkExporterCollect:
         assert b"wrk_jobs" in body
         assert b"wrk_workers_online" in body
         assert "text/plain" in content_type
+
+
+class TestWaitingStalledGauge:
+    async def _backdate(self, app, job_id, interval):
+        import psycopg
+
+        from psycopg.sql import SQL
+
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("UPDATE {jobs} SET enqueued_at = NOW() - %s::interval WHERE id = %s").format(jobs=app._t["jobs"]),
+                (interval, job_id),
+            )
+
+    def _stalled(self, exporter):
+        return {labels: g._value.get() for labels, g in exporter._waiting_stalled._metrics.items()}
+
+    async def test_counts_only_old_waiting_jobs(self, app):
+        parent = await app.enqueue(noop)
+        old = await app.enqueue(noop, _depends_on=parent)
+        await app.enqueue(noop, _depends_on=parent)  # fresh: not stalled
+        await self._backdate(app, old.id, "2 hours")
+
+        exporter = WerkExporter(app)
+        await exporter.collect()
+
+        assert self._stalled(exporter) == {("default",): 1}
+
+    async def test_drops_queue_once_recovered(self, app):
+        parent = await app.enqueue(noop)
+        child = await app.enqueue(noop, _depends_on=parent)
+        await self._backdate(app, child.id, "2 hours")
+
+        exporter = WerkExporter(app)
+        await exporter.collect()
+        assert self._stalled(exporter) == {("default",): 1}
+
+        await make_worker(app).run()
+        await exporter.collect()
+        assert self._stalled(exporter) == {}

@@ -69,9 +69,10 @@ All workers share these constructor parameters:
 | `burst` | `False` | Exit once the queue is empty |
 | `before_process` | `[]` | Hooks called before each job starts |
 | `after_process` | `[]` | Hooks called after each job finishes |
-| `sweep_interval` | `60.0` | Seconds between maintenance sweeps |
+| `sweep_interval` | `60.0` | Seconds between maintenance passes |
 | `abort_interval` | `1.0` | Seconds between abort-signal checks |
 | `shutdown_timeout` | `30.0` | Seconds to wait for in-flight jobs during shutdown |
+| `maintenance` | `True` | Run the maintenance pass in this worker (see [Maintenance](#maintenance)) |
 
 ## Dequeue strategies
 
@@ -141,6 +142,31 @@ worker.push_exception_handler(report_error)
 ```
 
 Handlers are called in reverse push order (most recently pushed first). Use `pop_exception_handler()` to remove the top handler.
+
+## Maintenance
+
+Every `sweep_interval` seconds a maintenance pass:
+
+- **recovers stuck jobs** (the sweep). An `active` job whose timeout, heartbeat or
+  `max_active_secs` window has elapsed is requeued, or failed with `error = 'swept'` at its
+  attempt cap. An `aborting` job in the same situation ends `aborted` and is never requeued:
+  its dependents settle, `failure_mode="delete"` removes it, and `on_stopped` runs.
+- **settles stranded dependents.** A `waiting` job whose dependencies have all settled, but
+  that was never moved on (for example because a dependency was settled outside pgwerk), is
+  queued, or failed with `error = 'dependency failed'` when a required dependency failed.
+- **queues due scheduled jobs.**
+
+By default every worker runs it. To recover jobs with no worker up, run it on its own with
+[`werk maintain`](cli.md#werk-maintain), or inside the API process with `werk api --maintenance`.
+Then you can turn it off on workers with `maintenance=False`.
+
+Every query skips rows locked by another runner, so any number of them can run at once.
+Callbacks of jobs settled during maintenance (such as `on_stopped`) run in the process that
+ran it, so their modules must be importable there.
+
+The Prometheus exporter reports `wrk_waiting_jobs_stalled{queue}`: jobs in `waiting` for over
+an hour. Maintenance clears the ones whose dependencies settled; anything left there is
+waiting on a dependency that isn't progressing.
 
 ## Signals and shutdown
 

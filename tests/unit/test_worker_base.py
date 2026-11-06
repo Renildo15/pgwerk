@@ -295,3 +295,43 @@ class TestSweepLoop:
 
         with patch("pgwerk.worker.base.asyncio.sleep", fast_sleep):
             await w._sweep_loop()
+
+    async def test_sweep_loop_runs_full_maintenance_pass(self):
+        from pgwerk.repos import ReconcileResult
+
+        w = make_worker()
+        w._running = True
+        w.app.sweep = AsyncMock(return_value=[])
+        w.app.reconcile_waiting = AsyncMock(return_value=ReconcileResult(queued=0, failed=0))
+        w.app.reschedule_stuck = AsyncMock(return_value=0)
+
+        async def fast_sleep(delay):
+            w._running = False
+
+        with patch("pgwerk.worker.base.asyncio.sleep", fast_sleep):
+            await w._sweep_loop()
+
+        w.app.sweep.assert_awaited_once()
+        w.app.reconcile_waiting.assert_awaited_once()
+        w.app.reschedule_stuck.assert_awaited_once()
+
+
+class TestMaintenanceOption:
+    def test_maintenance_on_by_default(self):
+        assert make_worker().maintenance is True
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_run_starts_sweep_loop_only_when_enabled(self, enabled):
+        w = make_worker(maintenance=enabled, listen=False)
+        w.app.connect = AsyncMock()
+        with (
+            patch.object(w, "_register", AsyncMock()),
+            patch.object(w, "_deregister", AsyncMock()),
+            patch.object(w, "_heartbeat_loop", AsyncMock()),
+            patch.object(w, "_abort_loop", AsyncMock()),
+            patch.object(w, "_main_loop", AsyncMock()),
+            patch.object(w, "_sweep_loop", AsyncMock()) as sweep_loop,
+            patch.object(asyncio.get_running_loop(), "add_signal_handler"),
+        ):
+            await w.run()
+        assert sweep_loop.called is enabled

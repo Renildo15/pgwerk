@@ -156,3 +156,25 @@ class TestCreateApp:
         assert "/api/jobs" in paths
         assert "/api/workers" in paths
         assert "/api/stats" in paths
+
+
+class TestMaintenanceHook:
+    def test_no_maintenance_hook_by_default(self):
+        app = create_app(_cfg())
+        names = [getattr(h, "__qualname__", "") for h in app.on_startup]
+        assert not any("init_maintenance" in n for n in names)
+
+    def test_maintenance_hook_registered_when_enabled(self):
+        app = create_app(_cfg(maintenance=True))
+        startup = [getattr(h, "__qualname__", "") for h in app.on_startup]
+        shutdown = [getattr(h, "__qualname__", "") for h in app.on_shutdown]
+        assert any("init_maintenance" in n for n in startup)
+        # Stops before init_werk disconnects the instance it uses.
+        assert "init_maintenance" in shutdown[0]
+
+    def test_maintenance_round_trips_through_env(self, monkeypatch):
+        for key in list(__import__("os").environ):
+            if key.startswith("PGWERK_"):
+                monkeypatch.delenv(key)
+        WerkConfig(dsn="postgresql://x/y", maintenance=True).to_env()
+        assert WerkConfig.from_env().maintenance is True

@@ -51,6 +51,9 @@ class WerkConfig:
         ui: Serve the SPA dashboard (requires built static files).
         ui_auth: Basic Auth for the SPA as ``user:password``.
         api_token: Bearer token for all ``/api/*`` routes.
+        maintenance: Run the maintenance pass (sweep, stranded ``waiting`` job
+            reconciliation, rescheduling) inside the API process, every
+            ``sweep_interval``. Lets stuck jobs recover with no worker running.
         default_retry_backoff: When ``True`` (default), passing a plain integer
             to ``_retry`` synthesizes an exponential backoff schedule rather
             than retrying immediately. An explicit :class:`Retry` always wins.
@@ -89,6 +92,7 @@ class WerkConfig:
     ui: bool = True
     ui_auth: str | None = None
     api_token: str | None = None
+    maintenance: bool = False
 
     # LISTEN/NOTIFY
     listen: bool = True
@@ -129,6 +133,7 @@ class WerkConfig:
             ui=not _bool("PGWERK_NO_UI", False),
             ui_auth=os.environ.get("PGWERK_UI_AUTH"),
             api_token=os.environ.get("PGWERK_API_TOKEN"),
+            maintenance=_bool("PGWERK_MAINTENANCE", False),
             default_retry_backoff=_bool("PGWERK_DEFAULT_RETRY_BACKOFF", True),
             allow_truncate=_bool("PGWERK_ALLOW_TRUNCATE", False),
             listen=_bool("PGWERK_LISTEN", True),
@@ -154,6 +159,7 @@ class WerkConfig:
             os.environ["PGWERK_UI_AUTH"] = self.ui_auth
         if self.api_token:
             os.environ["PGWERK_API_TOKEN"] = self.api_token
+        os.environ["PGWERK_MAINTENANCE"] = "true" if self.maintenance else "false"
         os.environ["PGWERK_DEFAULT_RETRY_BACKOFF"] = "true" if self.default_retry_backoff else "false"
         os.environ["PGWERK_ALLOW_TRUNCATE"] = "true" if self.allow_truncate else "false"
         os.environ["PGWERK_LISTEN"] = "true" if self.listen else "false"

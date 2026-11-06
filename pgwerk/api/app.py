@@ -6,6 +6,7 @@ from .auth import make_bearer_guard
 from .auth import make_basic_auth_guard
 from .spa import init_spa
 from .deps import init_werk
+from .deps import init_maintenance
 from .routes import MetricsController
 from .routes import make_router
 from .exporter import init_exporter
@@ -36,6 +37,9 @@ def create_app(config: WerkConfig | None = None) -> Litestar:
     route_handlers: list = [make_router(guards=api_guards)]
 
     init_werk(config, state, dependencies, on_startup, on_shutdown)
+
+    if config.maintenance:
+        init_maintenance(state, on_startup, on_shutdown)
 
     if config.metrics:
         init_exporter(config.metrics_interval, state, on_startup, on_shutdown)

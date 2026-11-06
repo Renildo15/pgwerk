@@ -20,6 +20,8 @@ BaseWorker(
     sweep_interval: float | None = None,
     abort_interval: float | None = None,
     shutdown_timeout: float | None = None,
+    listen: bool | None = None,
+    maintenance: bool = True,
 )
 ```
 
@@ -27,7 +29,7 @@ BaseWorker(
 
 #### `run() → None`
 
-Start the worker. Registers the worker in the database, starts side tasks (heartbeat, listen, abort, sweep loops), processes jobs until shutdown, then deregisters.
+Start the worker. Registers the worker in the database, starts side tasks (heartbeat, listen, abort, and — unless `maintenance=False` — maintenance loops), processes jobs until shutdown, then deregisters.
 
 #### `add_before_process(hook) → None`
 

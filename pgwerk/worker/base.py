@@ -31,6 +31,7 @@ from ..logging import job_id_var
 from ..schemas import Job
 from ..schemas import Context
 from ..serializers import encode
+from ..maintenance import Maintenance
 
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class BaseWorker(abc.ABC):
         abort_interval: float | None = None,
         shutdown_timeout: float | None = None,
         listen: bool | None = None,
+        maintenance: bool = True,
     ) -> None:
         """Initialise the worker with scheduling and concurrency settings.
 
@@ -85,6 +87,10 @@ class BaseWorker(abc.ABC):
                 instant ``NOTIFY``-driven wake-up. Falls back to
                 ``app.config.listen``. Set to ``False`` when using PgBouncer
                 in transaction-pooling mode.
+            maintenance: Run the maintenance pass (sweep, stranded ``waiting``
+                job reconciliation, rescheduling) every ``sweep_interval``.
+                Set to ``False`` when ``wrk maintain`` or the API process
+                already runs it.
         """
         self.app = app
         self.queues = queues or ["default"]
@@ -101,6 +107,7 @@ class BaseWorker(abc.ABC):
         self._abort_interval = abort_interval if abort_interval is not None else app.config.abort_interval
         self.shutdown_timeout = shutdown_timeout if shutdown_timeout is not None else app.config.shutdown_timeout
         self.listen = listen if listen is not None else app.config.listen
+        self.maintenance = maintenance
 
         self.id = uuid.uuid4().hex
         self.name = f"{socket.gethostname()}.{os.getpid()}"
@@ -215,8 +222,9 @@ class BaseWorker(abc.ABC):
             side_tasks = [
                 asyncio.ensure_future(self._heartbeat_loop()),
                 asyncio.ensure_future(self._abort_loop()),
-                asyncio.ensure_future(self._sweep_loop()),
             ]
+            if self.maintenance:
+                side_tasks.append(asyncio.ensure_future(self._sweep_loop()))
             if self.listen:
                 side_tasks.append(asyncio.ensure_future(self._listen_loop()))
             try:
@@ -349,14 +357,12 @@ class BaseWorker(abc.ABC):
     # ------------------------------------------------------------------
 
     async def _sweep_loop(self) -> None:
+        maintenance = Maintenance(self.app, interval=self._sweep_interval)
         while self._running:
             await asyncio.sleep(self._sweep_interval)
-            try:
-                swept = await self.app.sweep()
-                if swept:
-                    logger.info("Worker %s: swept %d job(s)", self.name, len(swept))
-            except Exception as exc:
-                logger.warning("Worker %s: sweep error: %s", self.name, exc)
+            report = await maintenance.run_once()  # never raises; logs its own errors
+            if report.swept:
+                logger.info("Worker %s: swept %d job(s)", self.name, len(report.swept))
 
     # ------------------------------------------------------------------
     # Main loop

@@ -56,6 +56,24 @@ class TestCliCommands:
         result = runner.invoke(cli, ["info", "--help"])
         assert result.exit_code == 0
 
+    def test_maintain_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["maintain", "--help"])
+        assert result.exit_code == 0
+        assert "--once" in result.output
+        assert "--interval" in result.output
+
+    def test_maintain_requires_dsn(self, monkeypatch):
+        monkeypatch.delenv("PGWERK_DSN", raising=False)
+        result = CliRunner().invoke(cli, ["maintain"])
+        assert result.exit_code != 0
+        assert "--dsn" in result.output
+
+    def test_api_has_maintenance_flag(self):
+        result = CliRunner().invoke(cli, ["api", "--help"])
+        assert result.exit_code == 0
+        assert "--maintenance" in result.output
+
     def test_purge_help(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["purge", "--help"])

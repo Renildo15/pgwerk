@@ -11,7 +11,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- `Werk.reconcile_waiting()`: `waiting` jobs whose dependencies have all settled are queued, or failed with `dependency failed` when a required dependency failed (cascading to their own dependents). Previously such jobs stayed in `waiting` forever.
+- `werk maintain`: runs the maintenance pass (sweep, stranded `waiting` job recovery, rescheduling) without a worker, so stuck jobs recover even when no worker is up. `--once` runs a single pass.
+- `werk api --maintenance` (`PGWERK_MAINTENANCE`, `WerkConfig.maintenance`) runs the same pass inside the API process.
+- Worker option `maintenance=True`. Set it to `False` on workers when `werk maintain` or the API process already runs maintenance.
+- `Werk.reconcile_waiting()`, part of every maintenance pass: `waiting` jobs whose dependencies have all settled are queued, or failed with `dependency failed` when a required dependency failed (cascading to their own dependents). Previously such jobs stayed in `waiting` forever.
+- Exporter gauge `wrk_waiting_jobs_stalled{queue}`: jobs in `waiting` for over an hour.
 
 ### Fixed
 

@@ -140,6 +140,30 @@ pip install "pgwerk[analytics]"
 werk dashboard myapp.tasks:app
 ```
 
+### `werk maintain`
+
+Run the [maintenance pass](workers.md#maintenance) without a worker: recover stuck jobs,
+settle dependents stranded in `waiting`, and queue due scheduled jobs. Safe to run next to
+workers and other `werk maintain` processes.
+
+```bash
+# Every 60s (or $PGWERK_SWEEP_INTERVAL) until SIGTERM/SIGINT
+werk maintain --dsn postgresql://localhost/mydb
+
+# One pass, e.g. from cron; prints what it did
+werk maintain --dsn postgresql://localhost/mydb --once
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--dsn` | `$PGWERK_DSN` | Postgres connection string |
+| `--schema` / `--prefix` | `pgwerk` / `_pgwerk` | Table naming |
+| `--interval` | `60` | Seconds between passes |
+| `--once` | off | Run one pass and exit |
+
+Callbacks of jobs settled here run in this process, so run it where your task modules are
+importable.
+
 ### `werk api`
 
 Start the REST API server (requires the `litestar` optional extra).

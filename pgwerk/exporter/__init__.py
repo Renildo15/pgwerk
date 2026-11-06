@@ -46,6 +46,7 @@ class WerkExporter:
         registry: "CollectorRegistry | None" = None,
         namespace: str = "wrk",
         latency_window_secs: int = 600,
+        stalled_waiting_secs: int = 3600,
     ) -> None:
         try:
             from prometheus_client import Gauge
@@ -58,6 +59,7 @@ class WerkExporter:
         self._pgwerk = werk
         self._interval = interval
         self._latency_window = latency_window_secs
+        self._stalled_waiting = stalled_waiting_secs
         self._task: asyncio.Task[None] | None = None
 
         self._registry: CollectorRegistry = registry or _Registry()
@@ -86,6 +88,13 @@ class WerkExporter:
         self._failed_total = _g(
             "jobs_failed_recent",
             f"Jobs failed in the last {latency_window_secs}s, by queue (windowed gauge, not a monotonic counter)",
+            ["queue"],
+        )
+        self._waiting_stalled = _g(
+            "waiting_jobs_stalled",
+            f"Jobs in 'waiting' for over {stalled_waiting_secs}s, by queue. A dependency that never "
+            "settles strands its dependents silently; maintenance recovers the ones whose "
+            "dependencies did settle.",
             ["queue"],
         )
 
@@ -199,6 +208,22 @@ class WerkExporter:
                         self._duration_seconds.labels(queue=q).set(float(row["avg_duration"]))
                     self._throughput.labels(queue=q).set(row["completed"])
                     self._failed_total.labels(queue=q).set(row["failed"])
+
+                # --- waiting jobs stalled past the threshold ---
+                await cur.execute(
+                    SQL("""
+                        SELECT queue, COUNT(*) AS stalled
+                        FROM {jobs}
+                        WHERE status = 'waiting'
+                          AND enqueued_at < NOW() - %(threshold)s * INTERVAL '1 second'
+                        GROUP BY queue
+                    """).format(jobs=t["jobs"]),
+                    {"threshold": self._stalled_waiting},
+                )
+                stalled_rows = await cur.fetchall()
+                self._waiting_stalled.clear()  # drop queues that recovered
+                for row in stalled_rows:
+                    self._waiting_stalled.labels(queue=row["queue"]).set(row["stalled"])
 
     # ------------------------------------------------------------------
     # Exposition

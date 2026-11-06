@@ -97,3 +97,29 @@ class TestReconcileWaiting:
         assert (await app.reconcile_waiting(limit=2)).queued == 1
         assert all([(await app.get_job(c.id)).status == JobStatus.Queued for c in children])
 
+
+class TestMaintenanceWithoutWorkers:
+    async def test_run_once_recovers_stuck_and_stranded_jobs(self, app):
+        from pgwerk.maintenance import Maintenance
+
+        stuck = await app.enqueue(noop)
+        parent = await app.enqueue(noop)
+        stranded = await app.enqueue(noop, _depends_on=parent)
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("""
+                    UPDATE {jobs}
+                    SET status = 'active', started_at = NOW() - INTERVAL '2 hour', worker_id = gen_random_uuid()
+                    WHERE id = %s
+                """).format(jobs=app._t["jobs"]),
+                (stuck.id,),
+            )
+        await _set_status(app, parent.id, "complete")
+
+        report = await Maintenance(app).run_once()
+
+        assert report.errors == {}
+        assert stuck.id in report.swept
+        assert report.reconciled.queued == 1
+        assert (await app.get_job(stuck.id)).status == JobStatus.Queued
+        assert (await app.get_job(stranded.id)).status == JobStatus.Queued

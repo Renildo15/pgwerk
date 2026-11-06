@@ -28,6 +28,13 @@ from ..logging import configure_logging
 @click.option("--ui-auth", default=None, envvar="PGWERK_UI_AUTH", help="Basic Auth for the SPA as user:password.")
 @click.option("--api-token", default=None, envvar="PGWERK_API_TOKEN", help="Bearer token for the API.")
 @click.option(
+    "--maintenance",
+    is_flag=True,
+    default=False,
+    envvar="PGWERK_MAINTENANCE",
+    help="Run the maintenance pass (sweep, stranded-job recovery) in this process.",
+)
+@click.option(
     "--log-level",
     "-l",
     default="INFO",
@@ -55,6 +62,7 @@ def api(
     no_ui: bool,
     ui_auth: str | None,
     api_token: str | None,
+    maintenance: bool,
     log_level: str,
     log_format: str,
     no_color: bool,
@@ -79,6 +87,7 @@ def api(
         ui=not no_ui,
         ui_auth=ui_auth,
         api_token=api_token,
+        maintenance=maintenance,
     )
 
     config.to_env()

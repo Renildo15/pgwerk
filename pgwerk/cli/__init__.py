@@ -8,6 +8,7 @@ from .dashboard import dashboard
 from .info import info
 from .jobs import jobs
 from .migrate import migrate
+from .maintain import maintain
 from .purge import purge
 from .slowest import slowest
 from .stats import stats
@@ -30,6 +31,7 @@ cli.add_command(slowest)
 cli.add_command(dashboard)
 cli.add_command(info)
 cli.add_command(migrate)
+cli.add_command(maintain)
 cli.add_command(purge)
 
 

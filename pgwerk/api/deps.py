@@ -63,3 +63,36 @@ def init_werk(
         return state["werk"]
 
     dependencies["werk"] = Provide(_get_werk, use_cache=True)
+
+
+def init_maintenance(state: dict, on_startup: list, on_shutdown: list) -> None:
+    """Run the maintenance pass in the API process (``WerkConfig.maintenance``).
+
+    Registered after :func:`init_werk`, so the connected instance is in ``state``.
+
+    Args:
+        state: Shared state dict holding the connected Werk instance under "werk".
+        on_startup: List of startup callables to append to.
+        on_shutdown: List of shutdown callables to append to.
+    """
+    import asyncio
+
+    from ..maintenance import Maintenance
+
+    async def _start() -> None:
+        maintenance = Maintenance(state["werk"])
+        state["maintenance"] = maintenance
+        state["maintenance_task"] = asyncio.create_task(maintenance.run())
+
+    async def _stop() -> None:
+        maintenance = state.pop("maintenance", None)
+        task = state.pop("maintenance_task", None)
+        if maintenance is not None:
+            maintenance.stop()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    on_startup.append(_start)
+    # Before init_werk's shutdown hook disconnects the instance the task is using.
+    on_shutdown.insert(0, _stop)
