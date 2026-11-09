@@ -31,7 +31,8 @@ every request and checks how the client behaves:
 - fresh vs reused `claim_id`;
 - heartbeat cadence;
 - `complete` retries;
-- reactions to `lease_lost`, `abort`, `too_large`, `draining` and `401`;
+- reactions to `lease_lost`, `abort`, `too_large`, `draining`, `401 unauthorized` (stop) and
+  `401 session_expired` (register again, drop the held attempt);
 - structured errors;
 - the `args` rule for non-Python clients.
 

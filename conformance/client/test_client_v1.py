@@ -143,6 +143,54 @@ def test_unauthorized_stops_the_client(scenario):  # §2
     proc = run_client(s, lambda s: False, timeout=8)
     assert proc.returncode is not None
     assert len(s.of("claim")) <= 2, "a client must stop using a token the server refuses"
+    assert len(s.of("register")) == 1, "unauthorized means retired: the client must not register again"
+
+
+class _Expiring(Scenario):
+    """Each register hands out a new worker token; the first session is expired."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.tokens: list[str] = []
+
+    def on_register(self, call: Call):
+        import uuid
+
+        self.worker_token = f"pgwk_w_{uuid.uuid4().hex}_{'w' * 43}"
+        self.tokens.append(self.worker_token)
+        return super().on_register(call)
+
+    def first_session(self, call: Call) -> bool:
+        return call.headers.get("authorization") == f"Bearer {self.tokens[0]}"
+
+
+def test_session_expired_registers_again_and_carries_on(scenario):  # §2, §8
+    class S(_Expiring):
+        def on_claim(self, call: Call):
+            if self.first_session(call):
+                return err(401, "session_expired")
+            return super().on_claim(call)
+
+    s = S(jobs=[{"function": "conformance.echo", "kwargs": {"x": 1}, "lease_id": "L-after"}])
+    run_client(s, lambda s: bool(s.of("complete", "L-after")), timeout=20)
+    registers = s.of("register")
+    assert len(registers) == 2, "a client must register again after session_expired"
+    assert registers[1].headers["authorization"] == f"Bearer {ENROLLMENT}"
+    [complete] = s.of("complete", "L-after")
+    assert complete.headers["authorization"] == f"Bearer {s.tokens[1]}"
+
+
+def test_session_expired_drops_the_attempt_it_held(scenario):  # §2
+    class S(_Expiring):
+        def on_heartbeat(self, call: Call):
+            if self.first_session(call):
+                return err(401, "session_expired")
+            return super().on_heartbeat(call)
+
+    s = S(jobs=[{"function": "conformance.sleep", "kwargs": {"seconds": 4}, "lease_id": "L-old"}])
+    run_client(s, lambda s: len(s.of("register")) >= 2, timeout=20)
+    time.sleep(5)  # longer than the job: an attempt that kept running would report by now
+    assert not s.of("complete", "L-old") and not s.of("fail", "L-old"), "attempts of an expired session are lost"
 
 
 def test_positional_args(scenario):  # §7

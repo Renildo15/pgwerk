@@ -14,7 +14,9 @@ as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
   bodies are JSON (`Content-Type: application/json`). An endpoint whose request body is optional
   accepts an empty body or `{}`.
 - Clients **MUST** use HTTPS in production. A client **SHOULD** refuse a plain `http://` server URL
-  unless the user explicitly opts in (for local testing).
+  (whatever the scheme's case) unless the user explicitly opts in (for local testing).
+- Clients **MUST NOT** follow redirects: the bearer token would go along to wherever they point.
+  A `3xx` answer is treated like any unexpected response.
 - Every request **MUST** carry the header `Pgwerk-Protocol: 1`. A server **MUST** reject a request
   without it with `400` and the code `protocol`.
 - A server **MUST** ignore request fields it doesn't know, and a client **MUST** ignore response
@@ -36,9 +38,14 @@ There are two bearer tokens, sent as `Authorization: Bearer <token>`:
   token again.
 - The client **MUST** keep the worker token in memory only, and **MUST** use it for every other call.
 - The server checks the token on every call. A token that is invalid, revoked, of the wrong kind,
-  or belongs to a stopped worker gets `401 unauthorized`.
-- A client that gets `401` with a worker token **MUST** stop using that token. It **MAY** register
-  again with its enrollment token (which fails with `401` if that token was revoked or expired).
+  or belongs to a retired (revoked, drained or deregistered) worker gets `401 unauthorized`.
+- The server **MAY** expire the session of a worker it heard nothing from for a while, even one
+  waiting in a claim long-poll, but never before `claim_wait + lease_ttl` seconds and never while
+  the worker holds a live lease. Its next call gets `401 session_expired`.
+- A client that gets `401` with a worker token **MUST** stop using that token. On `session_expired`
+  it **SHOULD** register again with its enrollment token and carry on (an outage of either side can
+  cause it). Any attempt it held under the old session is lost: it **MUST NOT** report it. On
+  `unauthorized` it **MUST NOT** register again on its own: the operator retired it.
 
 ## 3. Lifecycle
 
@@ -74,7 +81,8 @@ or `fail` that reaches the server for an aborted job settles it as `aborted` eit
 - A claim answered with `403 draining` means the operator is retiring this worker. The client
   **MUST NOT** claim again. It **SHOULD** finish and report the jobs it holds (heartbeats and
   reports are still accepted), then call `deregister`.
-- A worker that gets `401` was revoked or expired; see [§2](#2-authentication).
+- A worker that gets `401 unauthorized` was retired; one that gets `401 session_expired` registers
+  again. See [§2](#2-authentication).
 
 ## 4. Versioning
 
@@ -180,7 +188,9 @@ Request:
 or `{"aborted": true}` after an abort.
 
 - `error.type` is required unless `aborted` is true. The server truncates errors longer than
-  `limits.max_error_bytes`; it doesn't reject them.
+  `limits.max_error_bytes` (UTF-8 bytes of the stored JSON); it doesn't reject them. It keeps only
+  `type`, `message` and `stack`, cuts `type` at 256 characters, and removes control characters
+  other than tab and newlines.
 - `retryable: false` fails the job for good, even with retries left. Retry scheduling is decided
   by the server, never by the client.
 
@@ -222,16 +232,17 @@ Every error response has the shape `{"error": {"code": "<code>", "message": "<te
 
 | Code | Status | Meaning | Client obligation |
 |---|---|---|---|
-| `bad_request` | 400 | The body is invalid | Fix the request; don't retry as is |
+| `bad_request` | 400 | The body is invalid (including JSON nested too deeply, or text Postgres can't store, such as NUL characters) | Fix the request; don't retry as is |
 | `protocol` | 400 | Missing or unsupported `Pgwerk-Protocol` | — |
-| `unauthorized` | 401 | Invalid, revoked or wrong kind of token, or the worker is stopped | Stop using the token ([§2](#2-authentication)) |
+| `unauthorized` | 401 | Invalid, revoked or wrong kind of token, or the worker was retired | Stop using the token; don't register again ([§2](#2-authentication)) |
+| `session_expired` | 401 | The server heard nothing from this worker for too long | Drop held attempts; register again ([§2](#2-authentication)) |
 | `scope` | 403 | Queues outside the token's scope, or no queues/functions | Don't retry |
 | `draining` | 403 | The worker is being retired | Stop claiming; finish held jobs; deregister |
 | `not_found` | 404 | Unknown endpoint | — |
 | `lease_lost` | 409 | This attempt no longer owns the job | Stop the job; drop its result |
 | `too_large` | 413 | The body (or result) is over the limit | For a result: report `fail` with `retryable: false` |
-| `rate_limited` | 429 | Too many claims | Back off, then retry |
-| `internal` | 5xx | Server error | Retry with backoff |
+| `rate_limited` | 429 | Too many claims, open claims or registrations, or too many live workers for the token | Back off, then retry |
+| `internal` | 5xx | Server error (`503` while the database is unavailable) | Retry with backoff |
 
 New codes may be added within v1. A client **MUST** treat an unknown code by its HTTP status
 class: retry on `5xx` and `429`, and don't retry other `4xx`.
@@ -243,7 +254,12 @@ class: retry on `5xx` and `429`, and don't retry other `4xx`.
 - `max_result_bytes` for results (default 1 MiB);
 - `max_error_bytes` for stored errors (default 64 KiB).
 
-The server **MUST** enforce body limits before parsing. Claims are rate limited per worker.
+The server **MUST** enforce body limits before parsing. Rate limits (claims per worker, open claims
+per worker, registrations and live workers per enrollment token) apply only once the token's secret
+checked out, so nobody can use up another worker's or token's allowance. At `register`, the
+reference server also accepts at most 100 queues and 1000 functions of up to 300 characters, and
+labels up to 8 KiB of JSON (`400 bad_request` beyond), strips control characters from `name`, and
+drops `progress` over 8 KiB while still renewing the lease.
 
 ## Conformance
 
@@ -251,7 +267,7 @@ The repository's `conformance/` directory certifies implementations:
 
 - `conformance/server`: HTTP tests that a server build **MUST** pass (run against any URL).
 - `conformance/client`: a scripted fake server that checks a client's behavior (retries,
-  `claim_id` reuse, heartbeat cadence, reactions to `lease_lost`, `abort`, `draining` and
-  `too_large`, and `args` handling).
+  `claim_id` reuse, heartbeat cadence, reactions to `lease_lost`, `abort`, `draining`,
+  `too_large`, `unauthorized` and `session_expired`, and `args` handling).
 
 See `conformance/README.md`.
