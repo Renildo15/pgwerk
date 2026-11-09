@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,7 +25,10 @@ class ProtocolError(Exception):
 
 class ProtocolClient:
     def __init__(self, url: str, *, insecure: bool = False, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        if url.startswith("http://") and not insecure:
+        scheme = urlsplit(url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"the server URL must be https:// (got {url!r})")
+        if scheme == "http" and not insecure:
             raise ValueError("refusing a plain http:// URL; use https://, or insecure=True for local testing")
         self._http = httpx.AsyncClient(
             base_url=url.rstrip("/") + "/remote/v1",

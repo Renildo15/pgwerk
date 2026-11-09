@@ -607,3 +607,18 @@ def test_truncate_error_unit():
     assert out["message"].startswith("ü" * 100) and out["message"].endswith("…[truncated]")
     small = {"type": "E", "message": "ok\nnext\ttab"}
     assert truncate_error(small, 4096) == small
+
+
+@pytest.mark.parametrize("url", ["HTTP://example.com", "Http://example.com", "ftp://example.com", "example.com"])
+def test_client_refuses_anything_but_https(url):
+    from pgwerk.remote.client.http import ProtocolClient
+
+    with pytest.raises(ValueError):
+        ProtocolClient(url)
+
+
+def test_client_accepts_https_in_any_case():
+    from pgwerk.remote.client.http import ProtocolClient
+
+    ProtocolClient("HTTPS://example.com")
+    ProtocolClient("http://localhost:8000", insecure=True)
