@@ -622,3 +622,22 @@ def test_client_accepts_https_in_any_case():
 
     ProtocolClient("HTTPS://example.com")
     ProtocolClient("http://localhost:8000", insecure=True)
+
+
+class TestOpenApiSchemaIsNotPublic:
+    """Regression: /schema served the OpenAPI document (every /api route) to anyone, even
+    with an admin token set."""
+
+    async def test_schema_needs_the_admin_token(self, app):
+        async with AsyncTestClient(app=create_app(_config(app))) as c:
+            assert (await c.get("/schema/openapi.json")).status_code == 401
+            ok = await c.get("/schema/openapi.json", headers={"Authorization": f"Bearer {ADMIN}"})
+            assert ok.status_code == 200 and "/remote/v1/claim" in ok.text
+
+    async def test_remote_only_process_serves_no_schema(self, app):
+        async with AsyncTestClient(app=create_app(_config(app, api=False, api_token=None))) as c:
+            assert (await c.get("/schema/openapi.json")).status_code == 404
+
+    def test_the_schema_can_still_be_built_in_process(self, app):
+        api = create_app(_config(app, api=False, api_token=None))
+        assert "/remote/v1/claim" in api.openapi_schema.to_schema()["paths"]

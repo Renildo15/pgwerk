@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from litestar import Router
 from litestar import Litestar
+from litestar.openapi import OpenAPIConfig
+from litestar.exceptions import NotFoundException
 
 from .auth import make_bearer_guard
 from .auth import make_basic_auth_guard
@@ -40,8 +43,8 @@ def create_app(config: WerkConfig | None = None) -> Litestar:
         )
 
     route_handlers: list = []
+    api_guards: list = []
     if config.api:
-        api_guards = []
         if config.api_token:
             api_guards.append(make_bearer_guard(config.api_token))
         route_handlers.append(make_router(guards=api_guards))
@@ -75,4 +78,21 @@ def create_app(config: WerkConfig | None = None) -> Litestar:
         on_startup=on_startup,
         on_shutdown=on_shutdown,
         exception_handlers={Exception: server_error_handler},
+        openapi_config=_openapi_config(config, api_guards if config.api else None),
+    )
+
+
+def _no_schema(*_: object) -> None:
+    raise NotFoundException()
+
+
+def _openapi_config(config: WerkConfig, api_guards: list | None) -> OpenAPIConfig:
+    """``/schema`` lists every route, so it is guarded like ``/api``: behind the admin
+    token when there is one, and not served at all by a process without the admin API
+    (a remote-only server). The schema is still built in-process either way."""
+    guards = api_guards if api_guards is not None else [_no_schema]
+    return OpenAPIConfig(
+        title="Litestar API",
+        version="1.0.0",
+        openapi_router=Router(path="/schema", route_handlers=[], guards=guards),
     )
