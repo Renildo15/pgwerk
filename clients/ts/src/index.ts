@@ -114,6 +114,7 @@ export class RemoteWorker {
   private leaseTtl = 60;
   private claimWait = 30;
   private draining = false;
+  private expired = false;
 
   constructor(options: RemoteWorkerOptions) {
     if (options.url.startsWith("http://") && !options.insecure) {
@@ -135,20 +136,31 @@ export class RemoteWorker {
     return this;
   }
 
-  /** Register, then process jobs until stop(), SIGTERM/SIGINT, or revocation. */
+  /**
+   * Register, then process jobs until stop(), SIGTERM/SIGINT, or revocation. If the server
+   * expires this worker's session (it heard nothing from it for too long, e.g. during an
+   * outage), the worker registers again and carries on.
+   */
   async run(): Promise<void> {
     if (this.handlers.size === 0) throw new Error("register at least one handler with handle()");
-    await this.register();
     const proc = globalProcess();
     const onSignal = () => this.stop();
     proc?.on?.("SIGTERM", onSignal);
     proc?.on?.("SIGINT", onSignal);
     try {
-      await Promise.all(Array.from({ length: this.concurrency }, () => this.slot()));
+      if (!(await this.register())) return;
+      for (;;) {
+        this.expired = false;
+        await Promise.all(Array.from({ length: this.concurrency }, () => this.slot()));
+        if (!this.expired || this.stopping.signal.aborted || this.revoked) break;
+        this.log("warn", "the server expired this session (it heard nothing from us for too long); registering again");
+        this.draining = false;
+        if (!(await this.register())) return;
+      }
     } finally {
       proc?.off?.("SIGTERM", onSignal);
       proc?.off?.("SIGINT", onSignal);
-      if (!this.revoked) {
+      if (this.workerId !== null && !this.revoked && !this.expired) {
         try {
           await this.call("/deregister", this.workerToken);
         } catch (err) {
@@ -197,7 +209,14 @@ export class RemoteWorker {
     return { status: resp.status, body: text ? (JSON.parse(text) as Body) : null };
   }
 
-  private async register(): Promise<void> {
+  /** End an expired session: running attempts lost their leases; register again. */
+  private expire(): void {
+    this.expired = true;
+    for (const claim of this.claims) claim.abort();
+  }
+
+  /** Register, retrying while the server is unreachable. False if stopped meanwhile. */
+  private async register(): Promise<boolean> {
     const body = {
       name: this.name,
       queues: this.queues,
@@ -213,12 +232,12 @@ export class RemoteWorker {
         this.workerToken = r.worker_token;
         this.leaseTtl = r.lease_ttl ?? 60;
         this.claimWait = r.claim_wait ?? 30;
-        return;
+        return true;
       } catch (err) {
         if (err instanceof ProtocolError && !err.retryable) throw err;
         this.log("warn", `register failed (${String(err)}), retrying`);
         await sleep(delay, this.stopping.signal);
-        if (this.stopping.signal.aborted) throw err;
+        if (this.stopping.signal.aborted) return false;
       }
     }
   }
@@ -228,7 +247,7 @@ export class RemoteWorker {
   private async slot(): Promise<void> {
     let claimId = crypto.randomUUID();
     let backoff = 1000;
-    while (!this.stopping.signal.aborted && !this.draining && !this.revoked) {
+    while (!this.stopping.signal.aborted && !this.draining && !this.revoked && !this.expired) {
       const controller = new AbortController();
       this.claims.add(controller);
       let result: { status: number; body: Body | null };
@@ -245,6 +264,10 @@ export class RemoteWorker {
         if (err instanceof ProtocolError && err.code === "draining") {
           this.log("info", "worker is draining: finishing held jobs");
           this.draining = true;
+          return;
+        }
+        if (err instanceof ProtocolError && err.code === "session_expired") {
+          this.expire();
           return;
         }
         if (err instanceof ProtocolError && err.status === 401) {
@@ -266,7 +289,7 @@ export class RemoteWorker {
   }
 
   private revoke(): void {
-    if (!this.revoked) this.log("error", "worker token no longer valid (revoked or expired); stopping");
+    if (!this.revoked) this.log("error", "worker token no longer valid (revoked or retired); stopping");
     this.revoked = true;
     this.stop();
   }
@@ -309,7 +332,8 @@ export class RemoteWorker {
         if (err instanceof ProtocolError && (err.code === "lease_lost" || err.status === 401)) {
           state.v = "lost";
           jobAbort.abort("lease_lost");
-          if (err.status === 401) this.revoke();
+          if (err.code === "session_expired") this.expire();
+          else if (err.status === 401) this.revoke();
         } else {
           this.log("warn", `heartbeat failed for ${job.id}: ${String(err)}`);
         }
@@ -379,6 +403,10 @@ export class RemoteWorker {
           if (err.code === "lease_lost") {
             this.log("warn", `job ${job.id} lost its lease; result dropped`);
             return;
+          }
+          if (err.code === "session_expired") {
+            this.log("warn", `session expired; result of job ${job.id} dropped`);
+            return this.expire();
           }
           if (err.status === 401) return this.revoke();
           if (!err.retryable) {

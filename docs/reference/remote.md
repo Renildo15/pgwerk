@@ -107,7 +107,8 @@ asyncio.run(worker.run())   # SIGTERM: finishes running jobs, then deregisters
   e.g. during an outage of either side), it expires the worker's session. The next call gets
   `401 session_expired`, and the client registers again with its enrollment token and carries on; jobs it held
   under the old session are lost and come back to the queue. A revoked or retired worker gets
-  `401 unauthorized` and stops.
+  `401 unauthorized` and stops. So does one whose session expired after its enrollment token did:
+  registering again needs a valid enrollment token. The Go and TypeScript clients behave the same.
 
 ## Other languages
 

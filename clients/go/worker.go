@@ -125,7 +125,10 @@ type RemoteWorker struct {
 	claimWait   int
 	draining    atomic.Bool
 	revoked     atomic.Bool
-	stop        context.CancelFunc
+	expired     atomic.Bool
+
+	stopMu sync.Mutex
+	stop   context.CancelFunc // ends the current session's claim loops
 }
 
 // NewRemoteWorker creates a worker for the server at url with an enrollment token.
@@ -176,7 +179,9 @@ func (w *RemoteWorker) WorkerID() string { return w.workerID }
 func (w *RemoteWorker) Revoked() bool { return w.revoked.Load() }
 
 // Run registers, then processes jobs until ctx is cancelled (or the worker is revoked or
-// told to drain). Running jobs finish first; then it deregisters.
+// told to drain). Running jobs finish first; then it deregisters. If the server expires
+// this worker's session (it heard nothing from it for too long, e.g. during an outage),
+// the worker registers again and carries on.
 func (w *RemoteWorker) Run(ctx context.Context) error {
 	if len(w.handlers) == 0 {
 		return errors.New("pgwerk: register at least one handler with Handle")
@@ -184,20 +189,36 @@ func (w *RemoteWorker) Run(ctx context.Context) error {
 	if err := w.register(ctx); err != nil {
 		return err
 	}
-	claimCtx, stop := context.WithCancel(ctx)
-	w.stop = stop
-	defer stop()
+	for {
+		w.expired.Store(false)
+		sessionCtx, stop := context.WithCancel(ctx)
+		w.stopMu.Lock()
+		w.stop = stop
+		w.stopMu.Unlock()
 
-	var wg sync.WaitGroup
-	for i := 0; i < w.concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			w.slot(claimCtx)
-		}()
+		var wg sync.WaitGroup
+		for i := 0; i < w.concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w.slot(sessionCtx)
+			}()
+		}
+		wg.Wait()
+		stop()
+		if !w.expired.Load() || ctx.Err() != nil || w.revoked.Load() {
+			break
+		}
+		w.logf("the server expired this session (it heard nothing from us for too long); registering again")
+		w.draining.Store(false)
+		if err := w.register(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
 	}
-	wg.Wait()
-	if !w.revoked.Load() {
+	if !w.revoked.Load() && !w.expired.Load() {
 		dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, _, err := w.call(dctx, "/deregister", w.workerToken, map[string]any{}); err != nil {
@@ -303,7 +324,7 @@ func (w *RemoteWorker) register(ctx context.Context) error {
 func (w *RemoteWorker) slot(ctx context.Context) {
 	claimID := newUUID()
 	backoff := time.Second
-	for ctx.Err() == nil && !w.draining.Load() && !w.revoked.Load() {
+	for ctx.Err() == nil && !w.draining.Load() && !w.revoked.Load() && !w.expired.Load() {
 		cctx, cancel := context.WithTimeout(ctx, time.Duration(w.claimWait+10)*time.Second)
 		status, raw, err := w.call(cctx, "/claim", w.workerToken, map[string]any{"claim_id": claimID, "wait": w.claimWait})
 		cancel()
@@ -315,7 +336,11 @@ func (w *RemoteWorker) slot(ctx context.Context) {
 			if errors.As(err, &pe) && pe.Code == "draining" {
 				w.logf("worker is draining: finishing held jobs")
 				w.draining.Store(true)
-				w.stop()
+				w.endSession()
+				return
+			}
+			if errors.As(err, &pe) && pe.Code == "session_expired" {
+				w.expire()
 				return
 			}
 			if errors.As(err, &pe) && pe.Status == 401 {
@@ -343,8 +368,21 @@ func (w *RemoteWorker) slot(ctx context.Context) {
 
 func (w *RemoteWorker) revoke() {
 	if !w.revoked.Swap(true) {
-		w.logf("worker token no longer valid (revoked or expired); stopping")
+		w.logf("worker token no longer valid (revoked or retired); stopping")
 	}
+	w.endSession()
+}
+
+// expire ends a session the server expired: its running attempts lost their leases, and
+// Run registers again.
+func (w *RemoteWorker) expire() {
+	w.expired.Store(true)
+	w.endSession()
+}
+
+func (w *RemoteWorker) endSession() {
+	w.stopMu.Lock()
+	defer w.stopMu.Unlock()
 	if w.stop != nil {
 		w.stop()
 	}
@@ -422,7 +460,9 @@ func (w *RemoteWorker) runJob(job Job) {
 				if errors.As(err, &pe) && (pe.Code == "lease_lost" || pe.Status == 401) {
 					state.CompareAndSwap(stateRunning, stateLost)
 					cancel()
-					if pe.Status == 401 {
+					if pe.Code == "session_expired" {
+						w.expire()
+					} else if pe.Status == 401 {
 						w.revoke()
 					}
 					return
@@ -517,6 +557,10 @@ func (w *RemoteWorker) report(job Job, path string, body map[string]any) {
 				continue
 			case pe.Code == "lease_lost":
 				w.logf("job %s lost its lease; result dropped", job.ID)
+				return
+			case pe.Code == "session_expired":
+				w.logf("session expired; result of job %s dropped", job.ID)
+				w.expire()
 				return
 			case pe.Status == 401:
 				w.revoke()
