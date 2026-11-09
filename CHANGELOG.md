@@ -36,6 +36,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - This release declares `max_compatible_db_version = 10`: it refuses to connect to a database whose schema is newer than 10. Earlier releases accepted any newer schema. Later breaking migrations rely on this bound to stop old code from running against them.
 - This release declares `min_compatible_db_version = 8`: a process with `auto_migrate=False` (such as `werk api`) refuses an unmigrated database at connect with `SchemaVersionMismatch`, instead of failing on its first query. Run `werk migrate` (or start a worker, which migrates) before rolling out processes that don't migrate. Workers from earlier releases are unaffected and keep running against schema 8.
 - **During a rolling deploy**, workers from earlier releases still run their own sweep with the old rules: a job without `heartbeat_secs` that runs longer than `max_active_secs` (1h by default) is requeued under its running attempt, as before this release. Upgrade all workers, or give long jobs `heartbeat_secs`.
+- This release requires schema 9 (`min_compatible_db_version = 9`): migrate before rolling out processes with `auto_migrate=False`.
 
 ### Fixed
 
