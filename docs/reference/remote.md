@@ -59,6 +59,13 @@ own worker token when it registers. An expired enrollment token stops new regist
 already registered keep working. Revoking releases the revoked workers' jobs back to the queue
 without counting them as lost.
 
+Limits, per server replica: a worker may claim `remote_claim_rate` times per second (burst
+`remote_claim_burst`) with at most `remote_max_claims_per_worker` long-polls open; a token may register
+`remote_register_rate` workers per second (burst `remote_register_burst`) and have at most
+`remote_max_workers_per_token` live ones. All limits apply only after the token's secret checked out,
+so a stranger who knows a worker or token id can't use them up. Names are stripped of control
+characters; queues, functions and labels have size limits.
+
 ## Python client
 
 ```bash

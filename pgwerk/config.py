@@ -70,6 +70,14 @@ class WerkConfig:
         remote_claim_rate: Claims per second allowed per remote worker (token bucket,
             per server replica), with bursts up to ``remote_claim_burst``.
         remote_claim_burst: Bucket size for ``remote_claim_rate``.
+        remote_max_claims_per_worker: Claim long-polls one remote worker may have open
+            at once (a worker opens one per concurrency slot).
+        remote_register_rate: Registrations per second allowed per enrollment token,
+            with bursts up to ``remote_register_burst``. Sized so a fleet sharing one
+            token comes back quickly after an outage (200 workers in about 10s).
+        remote_register_burst: Bucket size for ``remote_register_rate``.
+        remote_max_workers_per_token: Live (active or draining) remote workers one
+            enrollment token may have.
         remote_max_payload_bytes: Largest request body accepted (256 KiB).
         remote_max_result_bytes: Largest ``complete`` body accepted (1 MiB).
         remote_max_error_bytes: Longest error stored from a remote ``fail``; longer
@@ -143,6 +151,10 @@ class WerkConfig:
     remote_claim_wait: int = 30
     remote_claim_rate: float = 5.0
     remote_claim_burst: int = 10
+    remote_max_claims_per_worker: int = 32
+    remote_register_rate: float = 10.0
+    remote_register_burst: int = 100
+    remote_max_workers_per_token: int = 1000
     remote_max_payload_bytes: int = 256 * 1024
     remote_max_result_bytes: int = 1024 * 1024
     remote_max_error_bytes: int = 64 * 1024
@@ -202,6 +214,10 @@ class WerkConfig:
             remote_claim_wait=_int("PGWERK_REMOTE_CLAIM_WAIT", 30),
             remote_claim_rate=_float("PGWERK_REMOTE_CLAIM_RATE", 5.0),
             remote_claim_burst=_int("PGWERK_REMOTE_CLAIM_BURST", 10),
+            remote_max_claims_per_worker=_int("PGWERK_REMOTE_MAX_CLAIMS_PER_WORKER", 32),
+            remote_register_rate=_float("PGWERK_REMOTE_REGISTER_RATE", 10.0),
+            remote_register_burst=_int("PGWERK_REMOTE_REGISTER_BURST", 100),
+            remote_max_workers_per_token=_int("PGWERK_REMOTE_MAX_WORKERS_PER_TOKEN", 1000),
             remote_max_payload_bytes=_int("PGWERK_REMOTE_MAX_PAYLOAD_BYTES", 256 * 1024),
             remote_max_result_bytes=_int("PGWERK_REMOTE_MAX_RESULT_BYTES", 1024 * 1024),
             remote_max_error_bytes=_int("PGWERK_REMOTE_MAX_ERROR_BYTES", 64 * 1024),
@@ -244,6 +260,10 @@ class WerkConfig:
         os.environ["PGWERK_REMOTE_CLAIM_WAIT"] = str(self.remote_claim_wait)
         os.environ["PGWERK_REMOTE_CLAIM_RATE"] = str(self.remote_claim_rate)
         os.environ["PGWERK_REMOTE_CLAIM_BURST"] = str(self.remote_claim_burst)
+        os.environ["PGWERK_REMOTE_MAX_CLAIMS_PER_WORKER"] = str(self.remote_max_claims_per_worker)
+        os.environ["PGWERK_REMOTE_REGISTER_RATE"] = str(self.remote_register_rate)
+        os.environ["PGWERK_REMOTE_REGISTER_BURST"] = str(self.remote_register_burst)
+        os.environ["PGWERK_REMOTE_MAX_WORKERS_PER_TOKEN"] = str(self.remote_max_workers_per_token)
         os.environ["PGWERK_REMOTE_MAX_PAYLOAD_BYTES"] = str(self.remote_max_payload_bytes)
         os.environ["PGWERK_REMOTE_MAX_RESULT_BYTES"] = str(self.remote_max_result_bytes)
         os.environ["PGWERK_REMOTE_MAX_ERROR_BYTES"] = str(self.remote_max_error_bytes)

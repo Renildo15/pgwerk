@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import contextlib
 import base64
 import pickle
 
@@ -165,11 +166,12 @@ class TestConnectionPool:
         assert _config(app).pool_size is None  # unset: the API applies its default
 
 
-@pytest.fixture
-def live_server(app):
+@contextlib.asynccontextmanager
+async def _serve(app, **cfg):
     """A real server (uvicorn in a thread): the test client can't serve concurrent requests."""
     import time
     import socket
+    import asyncio
     import threading
 
     import uvicorn
@@ -179,7 +181,7 @@ def live_server(app):
         port = s.getsockname()[1]
     srv = uvicorn.Server(
         uvicorn.Config(
-            create_app(_config(app, api=False, api_token=None)),
+            create_app(_config(app, api=False, api_token=None, **cfg)),
             host="127.0.0.1",
             port=port,
             log_level="error",
@@ -192,9 +194,17 @@ def live_server(app):
         if srv.started:
             break
         time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}"
-    srv.should_exit = True
-    thread.join(10)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        srv.should_exit = True
+        await asyncio.to_thread(thread.join, 10)
+
+
+@pytest.fixture
+async def live_server(app):
+    async with _serve(app) as url:
+        yield url
 
 
 class TestOneWakePerGroup:
@@ -269,3 +279,128 @@ class TestOneWakePerGroup:
             results = await asyncio.wait_for(asyncio.gather(*polls), 6)
 
         assert sum(r.status_code == 200 for r in results) == 10  # the chain fanned out to all
+
+
+class TestRateLimitsAndBounds:
+    """Regressions from the security review: limits keyed on unauthenticated input, and
+    no bound on what a token holder could register."""
+
+    async def test_bogus_secrets_cannot_rate_limit_a_real_worker(self, app, client):
+        reg = await _register(app, client)
+        prefix, _, _secret = reg["worker_token"].rpartition("_")
+        bogus = f"{prefix}_{'x' * 43}"  # the victim's worker id, a wrong secret
+        for _ in range(30):
+            assert (await _claim(client, bogus)).status_code == 401
+        assert (await _claim(client, reg["worker_token"])).status_code == 204  # not 429
+
+    async def test_open_claims_per_worker_are_capped(self, app):
+        import asyncio
+
+        import httpx
+
+        async with _serve(app, remote_max_claims_per_worker=2) as url:
+            async with httpx.AsyncClient(base_url=f"{url}/remote/v1", timeout=10) as http:
+                enrollment, _ = await app.create_enrollment_token("box", ["default"])
+                reg = await http.post(
+                    "/register", headers=_h(enrollment), json={"queues": ["default"], "functions": [{"name": NOOP}]}
+                )
+                token = reg.json()["worker_token"]
+
+                async def poll(wait):
+                    return await http.post(
+                        "/claim", headers=_h(token), json={"claim_id": str(uuid.uuid4()), "wait": wait}
+                    )
+
+                held = [asyncio.create_task(poll(2)) for _ in range(2)]
+                await asyncio.sleep(0.5)
+                third = await poll(0)
+                await asyncio.gather(*held)
+                after = await poll(0)
+        assert (third.status_code, third.json()["error"]["code"]) == (429, "rate_limited")
+        assert after.status_code == 204  # the slots were given back
+
+    async def test_register_rate_counts_only_valid_secrets(self, app):
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        bogus = enrollment.rpartition("_")[0] + "_" + "y" * 43
+        body = {"queues": ["default"], "functions": [{"name": NOOP}]}
+        async with AsyncTestClient(
+            app=create_app(_config(app, remote_register_burst=2, remote_register_rate=0.01))
+        ) as c:
+            for _ in range(5):
+                assert (await c.post("/remote/v1/register", headers=_h(bogus), json=body)).status_code == 401
+            codes = [
+                (await c.post("/remote/v1/register", headers=_h(enrollment), json=body)).status_code for _ in range(3)
+            ]
+        assert codes == [201, 201, 429]
+
+    async def test_live_workers_per_token_are_capped(self, app):
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        body = {"queues": ["default"], "functions": [{"name": NOOP}]}
+        async with AsyncTestClient(app=create_app(_config(app, remote_max_workers_per_token=2))) as c:
+            codes = [
+                (await c.post("/remote/v1/register", headers=_h(enrollment), json=body)).status_code for _ in range(3)
+            ]
+        assert codes == [201, 201, 429]
+
+    async def test_register_bounds_and_cleans_what_a_worker_declares(self, app, client):
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        base = {"queues": ["default"], "functions": [{"name": NOOP}]}
+
+        too_many = {**base, "functions": [{"name": f"f{i}"} for i in range(1001)]}
+        resp = await client.post("/remote/v1/register", headers=_h(enrollment), json=too_many)
+        assert (resp.status_code, resp.json()["error"]["code"]) == (400, "bad_request")
+
+        big_labels = {**base, "labels": {"x": "a" * 9000}}
+        assert (await client.post("/remote/v1/register", headers=_h(enrollment), json=big_labels)).status_code == 400
+
+        evil = {**base, "name": "box\x1b]0;owned\x07\x1b[2J" + "n" * 500}
+        resp = await client.post("/remote/v1/register", headers=_h(enrollment), json=evil)
+        worker = await app.get_worker(resp.json()["worker_id"])
+        assert "\x1b" not in worker["name"] and "\x07" not in worker["name"]
+        assert len(worker["name"]) <= 200
+
+    async def test_enrollment_token_queues_cannot_contain_commas(self, app):
+        with pytest.raises(ValueError, match=","):
+            await app.create_enrollment_token("x", ["a,b"])
+
+    async def test_oversized_progress_is_dropped_but_the_lease_renewed(self, app, client):
+        reg = await _register(app, client)
+        await app.enqueue(noop)
+        claimed = (await _claim(client, reg["worker_token"])).json()
+        resp = await client.post(
+            f"/remote/v1/leases/{claimed['lease_id']}/heartbeat",
+            headers=_h(reg["worker_token"]),
+            json={"progress": {"log": "z" * 10_000}},
+        )
+        assert resp.status_code == 200
+        import psycopg
+        from psycopg.sql import SQL
+
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            cur = await conn.execute(
+                SQL("SELECT progress FROM {e} WHERE id = %s").format(e=app._t["executions"]), (claimed["lease_id"],)
+            )
+            assert (await cur.fetchone())[0] is None
+
+        small = {"step": 3}
+        resp = await client.post(
+            f"/remote/v1/leases/{claimed['lease_id']}/heartbeat",
+            headers=_h(reg["worker_token"]),
+            json={"progress": small},
+        )
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            cur = await conn.execute(
+                SQL("SELECT progress FROM {e} WHERE id = %s").format(e=app._t["executions"]), (claimed["lease_id"],)
+            )
+            assert (await cur.fetchone())[0] == small
+
+
+def test_rate_limiter_memory_is_bounded_and_lru():
+    from pgwerk.remote.server.limits import TokenBucket
+
+    bucket = TokenBucket(rate=1, burst=1, max_keys=100)
+    for i in range(1000):
+        bucket.allow(f"k{i}")
+        bucket.allow("hot")  # used all along: stays
+    assert len(bucket) == 100
+    assert not bucket.allow("hot")  # its state was kept, not reset by eviction

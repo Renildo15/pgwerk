@@ -31,8 +31,16 @@ from ..errors import RemoteError
 from ..errors import RateLimited
 from ..errors import Unauthorized
 from ..errors import ProtocolMismatch
+from .limits import MAX_NAME
+from .limits import MAX_QUEUES
+from .limits import MAX_FUNCTIONS
+from .limits import MAX_IDENTIFIER
+from .limits import MAX_CLIENT_FIELD
+from .limits import MAX_LABELS_BYTES
+from .limits import MAX_PROGRESS_BYTES
 from .limits import TokenBucket
 from .limits import read_body
+from .limits import clean_text
 from .limits import truncate_error
 from .longpoll import Waiters
 from ..repository import ClaimSpent
@@ -73,6 +81,8 @@ class RemoteServer:
             listen_connect=werk._direct_connect,
         )
         self.bucket = TokenBucket(config.remote_claim_rate, config.remote_claim_burst)
+        self.register_bucket = TokenBucket(config.remote_register_rate, config.remote_register_burst)
+        self._open_claims: dict[str, int] = {}
         self._background: set[asyncio.Task] = set()
 
     async def start(self) -> None:
@@ -130,9 +140,13 @@ def _uuid(value: Any, field: str) -> str:
         raise RemoteError(f"{field} must be a UUID") from None
 
 
-def _str_list(value: Any, field: str) -> list[str]:
+def _str_list(value: Any, field: str, max_items: int) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
         raise RemoteError(f"{field} must be a list of non-empty strings")
+    if len(value) > max_items:
+        raise RemoteError(f"{field}: at most {max_items} entries")
+    if any(len(v) > MAX_IDENTIFIER for v in value):
+        raise RemoteError(f"{field}: each entry at most {MAX_IDENTIFIER} characters")
     return value
 
 
@@ -165,14 +179,31 @@ async def register(request: Request, remote: RemoteServer) -> dict[str, Any]:
     token = _token(request, "enrollment")
     body = await _json(request, cfg.remote_max_payload_bytes)
     functions = [f["name"] if isinstance(f, dict) else f for f in body.get("functions") or []]
-    queues = _str_list(body.get("queues"), "queues")
-    functions = _str_list(functions, "functions")
+    queues = _str_list(body.get("queues"), "queues", MAX_QUEUES)
+    functions = _str_list(functions, "functions", MAX_FUNCTIONS)
     if not queues or not functions:
         raise Scope("declare at least one queue and one function")
-    client = body.get("client") if isinstance(body.get("client"), dict) else {}
+    raw_client = body.get("client") if isinstance(body.get("client"), dict) else {}
+    client = {k: clean_text(raw_client[k], MAX_CLIENT_FIELD) for k in ("lang", "version") if k in raw_client}
     labels = body.get("labels") if isinstance(body.get("labels"), dict) else {}
+    if len(json.dumps(labels).encode()) > MAX_LABELS_BYTES:
+        raise RemoteError(f"labels: at most {MAX_LABELS_BYTES} bytes of JSON")
+
+    def admit() -> None:
+        # Called once the token's secret checked out, so a stranger who only knows the
+        # token id can't use up its registrations.
+        if not remote.register_bucket.allow(token.id):
+            raise RateLimited("too many registrations with this token; slow down")
+
     worker_id, worker_token = await remote.repo.register(
-        token, name=str(body.get("name") or "remote"), queues=queues, functions=functions, labels=labels, client=client
+        token,
+        name=clean_text(body.get("name") or "remote", MAX_NAME) or "remote",
+        queues=queues,
+        functions=functions,
+        labels=labels,
+        client=client,
+        admit=admit,
+        max_workers=cfg.remote_max_workers_per_token,
     )
     return {
         "worker_id": worker_id,
@@ -204,10 +235,24 @@ async def claim(request: Request, remote: RemoteServer) -> Response:
     wait = max(
         0.0, min(float(wait) if isinstance(wait, (int, float)) else cfg.remote_claim_wait, cfg.remote_claim_wait)
     )
-    if not remote.bucket.allow(token.id):
-        raise RateLimited("too many claims; slow down")
-
     session = await remote.repo.authenticate(token, claiming=True)
+    # Limits are keyed on the authenticated worker: keyed on the token's id alone, a
+    # stranger who knows it could drain this worker's bucket with bogus secrets.
+    if not remote.bucket.allow(session.worker_id):
+        raise RateLimited("too many claims; slow down")
+    if remote._open_claims.get(session.worker_id, 0) >= cfg.remote_max_claims_per_worker:
+        raise RateLimited(f"at most {cfg.remote_max_claims_per_worker} open claims per worker")
+    remote._open_claims[session.worker_id] = remote._open_claims.get(session.worker_id, 0) + 1
+    try:
+        return await _long_poll(remote, token, session, claim_id, wait)
+    finally:
+        left = remote._open_claims.pop(session.worker_id, 1) - 1
+        if left > 0:
+            remote._open_claims[session.worker_id] = left
+
+
+async def _long_poll(remote: RemoteServer, token: Any, session: Any, claim_id: str, wait: float) -> Response:
+    cfg = remote.config
     deadline = time.monotonic() + wait
     async with remote.waiters.subscribe(session.queues, session.functions) as woken:
         while True:
@@ -244,8 +289,13 @@ async def heartbeat(request: Request, remote: RemoteServer, lease_id: str) -> di
     cfg = remote.config
     token = _token(request, "worker")
     body = await _json(request, cfg.remote_max_payload_bytes)
+    progress = body.get("progress")
+    if progress is not None and len(json.dumps(progress).encode()) > MAX_PROGRESS_BYTES:
+        # Renew the lease anyway: failing the heartbeat would lose a healthy job.
+        logger.info("remote: progress over %d bytes dropped for lease %s", MAX_PROGRESS_BYTES, lease_id)
+        progress = None
     expires_at, abort = await remote.repo.heartbeat(
-        token, _uuid(lease_id, "lease_id"), cfg.remote_lease_ttl, progress=body.get("progress")
+        token, _uuid(lease_id, "lease_id"), cfg.remote_lease_ttl, progress=progress
     )
     return {"lease_expires_at": expires_at.isoformat(), "abort": abort}
 

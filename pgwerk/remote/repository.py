@@ -11,6 +11,7 @@ import uuid
 
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -21,6 +22,7 @@ from . import tokens
 from .errors import Scope
 from .errors import Draining
 from .errors import LeaseLost
+from .errors import RateLimited
 from .errors import Unauthorized
 from ..schemas import JOB_COLS
 from ..schemas import Job
@@ -96,6 +98,8 @@ class RemoteRepository:
         """
         if not queues:
             raise ValueError("an enrollment token needs at least one queue")
+        if any("," in q or not q for q in queues):
+            raise ValueError("queue names can't be empty or contain ','")
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT gen_random_uuid()::text AS id")
             row = await cur.fetchone()
@@ -214,8 +218,13 @@ class RemoteRepository:
         functions: list[str],
         labels: dict[str, Any] | None = None,
         client: dict[str, Any] | None = None,
+        admit: "Callable[[], None] | None" = None,
+        max_workers: int | None = None,
     ) -> tuple[str, str]:
         """Exchange an enrollment token for a new worker identity.
+
+        *admit* runs once the secret checked out and may raise (the server's
+        per-token rate limit). *max_workers* caps the token's live workers.
 
         Returns:
             ``(worker_id, worker_token)``. The worker token is returned only here.
@@ -223,6 +232,7 @@ class RemoteRepository:
         Raises:
             Unauthorized: unknown, revoked or expired enrollment token, or wrong secret.
             Scope: *queues* not within the token's queues, or no queues/functions.
+            RateLimited: the token already has *max_workers* live workers.
         """
         assert self._workers is not None
         if enrollment.kind != "enrollment":
@@ -231,11 +241,12 @@ class RemoteRepository:
             raise Scope("declare at least one queue and one function")
         client = client or {}
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+            # Check the secret before writing anything: an UPDATE first would lock the
+            # token row for whoever sends its id with a wrong secret.
             await cur.execute(
                 SQL("""
-                    UPDATE {t} SET last_used_at = NOW()
+                    SELECT secret_hash, queues FROM {t}
                     WHERE id = %(id)s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
-                    RETURNING secret_hash, queues
                 """).format(t=self._t["enrollment_tokens"]),
                 {"id": enrollment.id},
             )
@@ -245,6 +256,29 @@ class RemoteRepository:
             outside = sorted(set(queues) - set(row["queues"]))
             if outside:
                 raise Scope(f"queues not allowed by this token: {', '.join(outside)}")
+            if admit is not None:
+                admit()
+            await cur.execute(
+                SQL("""
+                    UPDATE {t} SET last_used_at = NOW()
+                    WHERE id = %(id)s AND revoked_at IS NULL
+                    RETURNING id
+                """).format(t=self._t["enrollment_tokens"]),
+                {"id": enrollment.id},
+            )
+            if await cur.fetchone() is None:  # revoked meanwhile
+                raise Unauthorized("invalid enrollment token")
+            if max_workers is not None:
+                await cur.execute(
+                    SQL("""
+                        SELECT count(*) AS n FROM {w}
+                        WHERE enrollment_token_id = %(id)s AND status IN ('active', 'draining')
+                    """).format(w=self._t["worker"]),
+                    {"id": enrollment.id},
+                )
+                live = await cur.fetchone()
+                if live is not None and live["n"] >= max_workers:
+                    raise RateLimited(f"this token already has {max_workers} live workers")
 
             worker_id = str(uuid.uuid4())
             worker_token, session_hash = tokens.generate("worker", worker_id)
