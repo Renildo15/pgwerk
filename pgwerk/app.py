@@ -898,7 +898,7 @@ class Werk:
         Returns:
             IDs of every job the sweep touched.
         """
-        swept = await self._settlement.sweep(self.max_active_secs, self.config.local_lease_ttl)
+        swept = await self._settlement.sweep(self.max_active_secs)
         if swept:
             logger.info("werk: sweep recovered %d stuck job(s): %s", len(swept), swept)
         return swept

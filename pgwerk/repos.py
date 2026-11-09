@@ -400,7 +400,7 @@ class JobRepository:
                                AND started_at + %(max_active_secs)s * INTERVAL '1 second' < NOW())
     """
 
-    async def lock_stuck(self, cur: Any, max_active_secs: int, local_lease_ttl: int = 300) -> list[tuple[Job, str]]:
+    async def lock_stuck(self, cur: Any, max_active_secs: int) -> list[tuple[Job, str]]:
         """Lock stuck ``active``/``aborting`` jobs, skipping rows locked elsewhere.
 
         Returns each job with why it is stuck:
@@ -408,9 +408,11 @@ class JobRepository:
         - ``"timeout"``: past ``timeout_secs`` (the backstop for a worker that died
           or hung without enforcing it).
         - ``"lease"``: its lease expired. While workers older than schema 8 may run
-          (rolling deploys), ``touched_at`` must be stale too: an old worker that
-          stole a leased row never renews ``lease_expires_at``, but its per-job
-          heartbeat keeps ``touched_at`` fresh.
+          (rolling deploys), a job with ``heartbeat_secs`` must also have a stale
+          ``touched_at``: an old worker that stole a leased row never renews
+          ``lease_expires_at``, but its per-job heartbeat keeps ``touched_at`` fresh.
+          Old workers only ever stole jobs with ``heartbeat_secs``, so other jobs are
+          recovered as soon as their lease expires, whatever its TTL (local or remote).
         - ``"legacy"``: no lease (claimed by a worker older than schema 8), stuck by
           the old heartbeat/``max_active_secs`` rules.
         """
@@ -434,8 +436,9 @@ class JobRepository:
                           OR
                           (lease_id IS NOT NULL
                            AND lease_expires_at < NOW()
-                           AND COALESCE(touched_at, started_at)
-                               + COALESCE(heartbeat_secs, %(local_lease_ttl)s) * INTERVAL '1 second' < NOW())
+                           AND (heartbeat_secs IS NULL
+                                OR COALESCE(touched_at, started_at)
+                                   + heartbeat_secs * INTERVAL '1 second' < NOW()))
                           OR
                           (lease_id IS NULL AND ("""
                 + self._STUCK_PREDICATE
@@ -449,7 +452,7 @@ class JobRepository:
                 FROM {jobs} JOIN stuck ON stuck._id = {jobs}.id
                 """
             ).format(jobs=self._t["jobs"]),
-            {"max_active_secs": max_active_secs, "local_lease_ttl": local_lease_ttl},
+            {"max_active_secs": max_active_secs},
         )
         out: list[tuple[Job, str]] = []
         for row in await cur.fetchall():

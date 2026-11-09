@@ -312,7 +312,7 @@ class Settlement:
             return dataclasses.replace(job, status=t.status, result=decode(self._jobs._serializer, t.result_json))
         return dataclasses.replace(job, status=t.status, error=t.error)
 
-    async def sweep(self, max_active_secs: int, local_lease_ttl: int = 300) -> list[str]:
+    async def sweep(self, max_active_secs: int) -> list[str]:
         """Recover stuck jobs whose worker stopped making progress.
 
         Each stuck job is locked, then settled by why it is stuck:
@@ -334,7 +334,7 @@ class Settlement:
         """
         settled: list[tuple[Job, Settled]] = []
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
-            stuck = await self._jobs.lock_stuck(cur, max_active_secs, local_lease_ttl)
+            stuck = await self._jobs.lock_stuck(cur, max_active_secs)
             requeue: list[Job] = []
             for job, reason in stuck:
                 fence = Fence(job.id, worker_id=None, attempt=job.attempts)

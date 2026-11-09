@@ -253,3 +253,36 @@ class TestDeregisterAndIdle:
         assert await app.expire_idle_remote_workers() == 0  # still holds a lease
         await app._remote_repo.report(wtoken, claimed.job.lease_id, Outcome("complete"))
         assert await app.expire_idle_remote_workers() == 1
+
+
+class TestRemoteLeaseRecovery:
+    async def test_lost_remote_job_comes_back_after_the_remote_ttl(self, app):
+        """A vanished remote worker's job is swept once its own lease expires.
+
+        Regression: the rolling-deploy guard also required touched_at to be older than
+        local_lease_ttl (300s), so a remote job with a 60s lease came back after ~5 minutes.
+        """
+        enrollment, _ = await _enroll(app)
+        _, wtoken = await _register(app, enrollment)
+        job = await app.enqueue(noop)
+        await app._remote_repo.claim(wtoken, str(uuid.uuid4()), 60)
+        # Last renewal 61s ago, lease (60s) expired 1s ago: well within local_lease_ttl.
+        await _sql(
+            app,
+            "UPDATE {jobs} SET touched_at = NOW() - INTERVAL '61 s', started_at = NOW() - INTERVAL '61 s',"
+            " lease_expires_at = NOW() - INTERVAL '1 s' WHERE id = %s",
+            job.id,
+        )
+        assert app.config.local_lease_ttl > 61
+
+        assert job.id in await app.sweep()
+        row = await app.get_job(job.id)
+        assert (row.status, row.lost_count, row.attempts) == (JobStatus.Queued, 1, 0)
+
+    async def test_live_remote_lease_is_not_swept(self, app):
+        enrollment, _ = await _enroll(app)
+        _, wtoken = await _register(app, enrollment)
+        await app.enqueue(noop)
+        await app._remote_repo.claim(wtoken, str(uuid.uuid4()), 60)
+        assert await app.sweep() == []
+
