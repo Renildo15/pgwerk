@@ -117,7 +117,11 @@ export class RemoteWorker {
   private expired = false;
 
   constructor(options: RemoteWorkerOptions) {
-    if (options.url.startsWith("http://") && !options.insecure) {
+    const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(options.url)?.[1]?.toLowerCase();
+    if (scheme !== "https" && scheme !== "http") {
+      throw new Error(`the server URL must be https:// (got ${JSON.stringify(options.url)})`);
+    }
+    if (scheme === "http" && !options.insecure) {
       throw new Error("refusing a plain http:// URL; use https://, or insecure: true for local testing");
     }
     this.base = options.url.replace(/\/+$/, "") + "/remote/v1";
@@ -187,6 +191,8 @@ export class RemoteWorker {
         headers: { "Content-Type": "application/json", "Pgwerk-Protocol": PROTOCOL, Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
         signal: AbortSignal.any(signals),
+        // Never follow a redirect: the bearer token would go along to wherever it points.
+        redirect: "manual",
       });
     } catch (err) {
       if (signal?.aborted) throw err;

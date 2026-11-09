@@ -164,3 +164,33 @@ func TestErrorTypes(t *testing.T) {
 		t.Errorf("NonRetryable should report the wrapped type, got %v", got)
 	}
 }
+
+func TestRefusesAnythingButHTTPSRegardlessOfCase(t *testing.T) {
+	for _, u := range []string{"HTTP://x", "Http://x", "ftp://x", "x"} {
+		if _, err := NewRemoteWorker(u, "t", Queues("q")); err == nil {
+			t.Fatalf("expected an error for %q", u)
+		}
+	}
+	if _, err := NewRemoteWorker("HTTPS://x", "t", Queues("q")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNeverFollowsRedirects(t *testing.T) {
+	w, err := NewRemoteWorker("https://x", "t", Queues("q"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.http.CheckRedirect == nil {
+		t.Fatal("the HTTP client must refuse redirects (the bearer token would follow them)")
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://x/remote/v1/claim", nil)
+	if err := w.http.CheckRedirect(req, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("CheckRedirect = %v, want http.ErrUseLastResponse", err)
+	}
+	custom := &http.Client{}
+	w, _ = NewRemoteWorker("https://x", "t", Queues("q"), HTTPClient(custom))
+	if w.http.CheckRedirect == nil {
+		t.Fatal("a caller's client must not follow redirects either")
+	}
+}

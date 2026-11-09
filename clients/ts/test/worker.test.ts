@@ -30,6 +30,10 @@ const job = { id: "j", leaseId: "L", leaseTtl: 1, heartbeatEvery: 1 } as any;
 test("refuses plain http unless insecure", () => {
   assert.throws(() => new RemoteWorker({ url: "http://x", token: "t", queues: ["q"] }));
   new RemoteWorker({ url: "http://x", token: "t", queues: ["q"], insecure: true });
+  for (const url of ["HTTP://x", "Http://x", "ftp://x", "x"]) {
+    assert.throws(() => new RemoteWorker({ url, token: "t", queues: ["q"] }), undefined, url);
+  }
+  new RemoteWorker({ url: "HTTPS://x", token: "t", queues: ["q"] });
 });
 
 test("sends the protocol header and the worker token", async () => {

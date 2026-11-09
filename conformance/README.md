@@ -33,6 +33,7 @@ every request and checks how the client behaves:
 - `complete` retries;
 - reactions to `lease_lost`, `abort`, `too_large`, `draining`, `401 unauthorized` (stop) and
   `401 session_expired` (register again, drop the held attempt);
+- never following a redirect (the bearer token would go along);
 - structured errors;
 - the `args` rule for non-Python clients.
 

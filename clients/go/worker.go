@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"sync"
@@ -149,9 +150,24 @@ func NewRemoteWorker(url, token string, opts ...Option) (*RemoteWorker, error) {
 	for _, o := range opts {
 		o(w)
 	}
-	if strings.HasPrefix(url, "http://") && !w.insecure {
-		return nil, errors.New("pgwerk: refusing a plain http:// URL; use https://, or Insecure() for local testing")
+	parsed, err := neturl.Parse(url)
+	if err != nil {
+		return nil, fmt.Errorf("pgwerk: bad server URL: %w", err)
 	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+	case "http":
+		if !w.insecure {
+			return nil, errors.New("pgwerk: refusing a plain http:// URL; use https://, or Insecure() for local testing")
+		}
+	default:
+		return nil, fmt.Errorf("pgwerk: the server URL must be https:// (got %q)", url)
+	}
+	// Never follow a redirect: the bearer token would go along to wherever it points.
+	// A caller's client is copied, not changed.
+	client := *w.http
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	w.http = &client
 	if len(w.queues) == 0 {
 		return nil, errors.New("pgwerk: Queues(...) is required")
 	}

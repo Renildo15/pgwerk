@@ -200,3 +200,15 @@ def test_positional_args(scenario):  # §7
         pytest.skip("Python clients may pass args positionally")
     [fail] = scenario.of("fail", "L-args")
     assert fail.body["retryable"] is False and fail.body["error"]["type"] == "UnsupportedPayload"
+
+
+def test_never_follows_a_redirect(scenario):  # §1, §2
+    class S(Scenario):
+        def on_claim(self, call: Call):
+            from litestar import Response
+
+            return Response(None, status_code=307, headers={"Location": "/remote/v1/redirected"})
+
+    s = S()
+    run_client(s, lambda s: len(s.of("claim")) >= 2, timeout=15)
+    assert not s.of("redirected"), "a client must not follow redirects: its bearer token would go along"

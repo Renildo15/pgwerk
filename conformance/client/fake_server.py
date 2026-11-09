@@ -105,6 +105,10 @@ class Scenario:
     def on_deregister(self, call: Call) -> Response:
         return Response(None, status_code=204)
 
+    def on_redirected(self, call: Call) -> Response:
+        """Where a redirect points: a client must never get here (its token would follow)."""
+        return Response(None, status_code=204)
+
 
 def _app(scenario: Scenario) -> Litestar:
     @post("/remote/v1/{path:path}")
