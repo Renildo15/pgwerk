@@ -15,7 +15,17 @@ class RemoteError(Exception):
 
 
 class Unauthorized(RemoteError):
+    """Invalid, revoked or retired credentials. Stop using the token."""
+
     status_code, code = 401, "unauthorized"
+
+
+class SessionExpired(Unauthorized):
+    """The server stopped this worker after hearing nothing from it for too long (for
+    example, while either side was unreachable). Not a revocation: register again with
+    the enrollment token and carry on. Jobs held under the old session are lost."""
+
+    code = "session_expired"
 
 
 class Scope(RemoteError):

@@ -404,3 +404,94 @@ def test_rate_limiter_memory_is_bounded_and_lru():
         bucket.allow("hot")  # used all along: stays
     assert len(bucket) == 100
     assert not bucket.allow("hot")  # its state was kept, not reset by eviction
+
+
+class TestSessionExpiry:
+    """Regression: a server outage (or a network one) longer than the idle threshold made
+    every idle remote worker exit for good. Idle expiry cleared the session like a
+    revocation, and the client stopped on any 401."""
+
+    @staticmethod
+    async def _expire_idle(app):
+        import psycopg
+        from psycopg.sql import SQL
+
+        async with await psycopg.AsyncConnection.connect(app.dsn, autocommit=True) as conn:
+            await conn.execute(
+                SQL("UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '1 hour' WHERE role = 'remote'").format(
+                    w=app._t["worker"]
+                )
+            )
+        return await app.expire_idle_remote_workers()
+
+    async def test_idle_expired_worker_gets_session_expired(self, app, client):
+        reg = await _register(app, client)
+        assert await self._expire_idle(app) == 1
+        resp = await _claim(client, reg["worker_token"])
+        assert (resp.status_code, resp.json()["error"]["code"]) == (401, "session_expired")
+
+        # Only the holder of the right secret learns that.
+        prefix = reg["worker_token"].rpartition("_")[0]
+        resp = await _claim(client, f"{prefix}_{'q' * 43}")
+        assert (resp.status_code, resp.json()["error"]["code"]) == (401, "unauthorized")
+
+    async def test_retired_revoked_and_deregistered_workers_stay_unauthorized(self, app, client):
+        enrollment, row = await app.create_enrollment_token("box", ["default"])
+        drained = await _register(app, client, enrollment=enrollment)
+        revoked = await _register(app, client, enrollment=enrollment)
+        gone = await _register(app, client, enrollment=enrollment)
+
+        await app.revoke_worker(drained["worker_id"], drain=True)
+        await app.expire_idle_remote_workers()  # the drained worker holds nothing: stopped
+        await app.revoke_worker(revoked["worker_id"])
+        assert (await client.post("/remote/v1/deregister", headers=_h(gone["worker_token"]))).status_code == 204
+
+        for reg in (drained, revoked, gone):
+            resp = await _claim(client, reg["worker_token"])
+            assert (resp.status_code, resp.json()["error"]["code"]) == (401, "unauthorized"), reg
+
+    async def test_expired_session_of_a_revoked_token_is_unauthorized(self, app, client):
+        enrollment, row = await app.create_enrollment_token("box", ["default"])
+        reg = await _register(app, client, enrollment=enrollment)
+        await self._expire_idle(app)
+        await app.revoke_enrollment_token(row["id"])
+        resp = await _claim(client, reg["worker_token"])
+        assert resp.json()["error"]["code"] == "unauthorized"
+
+    async def test_remote_worker_registers_again_and_keeps_working(self, app):
+        import asyncio
+
+        from pgwerk.remote import RemoteWorker
+
+        async def handler(ctx):
+            return "ok"
+
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        async with _serve(app, remote_claim_wait=1) as url:
+            worker = RemoteWorker(url, enrollment, ["default"], {NOOP: handler}, insecure=True)
+            run = asyncio.create_task(worker.run())
+            try:
+                for _ in range(100):
+                    if worker.worker_id:
+                        break
+                    await asyncio.sleep(0.05)
+                first = worker.worker_id
+                assert await self._expire_idle(app) == 1
+
+                for _ in range(100):  # its next claim gets session_expired; it registers again
+                    if worker.worker_id != first:
+                        break
+                    await asyncio.sleep(0.1)
+                assert worker.worker_id not in (None, first)
+                assert not run.done(), "the worker exited instead of registering again"
+
+                job = await app.enqueue(noop)
+                for _ in range(100):
+                    row = await app.get_job(job.id)
+                    if row.status.value == "complete":
+                        break
+                    await asyncio.sleep(0.1)
+                assert row.status.value == "complete"
+            finally:
+                worker.stop()
+                await asyncio.wait_for(run, 10)

@@ -101,6 +101,11 @@ asyncio.run(worker.run())   # SIGTERM: finishes running jobs, then deregisters
 - `timeout_secs` is enforced by the client.
 - If the worker's machine disappears, the job comes back after its lease TTL (60s), without using a
   retry, up to `_max_lost` times.
+- If the server hears nothing from an idle worker for a while (`max(2 × lease TTL, claim wait + lease TTL)`,
+  e.g. during an outage of either side), it expires the worker's session. The next call gets
+  `401 session_expired`, and the client registers again with its enrollment token and carries on; jobs it held
+  under the old session are lost and come back to the queue. A revoked or retired worker gets
+  `401 unauthorized` and stops.
 
 ## Large files
 

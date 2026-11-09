@@ -12,6 +12,7 @@ import uuid
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NoReturn
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ from .errors import Scope
 from .errors import Draining
 from .errors import LeaseLost
 from .errors import RateLimited
+from .errors import SessionExpired
 from .errors import Unauthorized
 from ..schemas import JOB_COLS
 from ..schemas import Job
@@ -328,10 +330,35 @@ class RemoteRepository:
         )
         row = await cur.fetchone()
         if row is None:
-            raise Unauthorized("invalid or revoked worker token")
+            await self._why_unauthorized(cur, token)
         if claiming and row["status"] == "draining":
             raise Draining("this worker is draining: finish the jobs you hold, then deregister")
         return Session(row["id"], row["queue"].split(","), row["functions"] or [], row["status"])
+
+    async def _why_unauthorized(self, cur: Any, token: tokens.ParsedToken) -> NoReturn:
+        """Raise :class:`SessionExpired` when idle expiry ended this worker's session
+        (it may register again), else :class:`Unauthorized`.
+
+        Idle expiry keeps the session hash; revocation, deregistration and the end of a
+        drain clear it, so only the holder of the right token learns it expired.
+        """
+        await cur.execute(
+            SQL("""
+                SELECT w.status, w.session_hash
+                FROM {w} w JOIN {t} t ON t.id = w.enrollment_token_id
+                WHERE w.id = %(id)s AND w.role = 'remote' AND t.revoked_at IS NULL
+            """).format(w=self._t["worker"], t=self._t["enrollment_tokens"]),
+            {"id": token.id},
+        )
+        row = await cur.fetchone()
+        if (
+            row is not None
+            and row["status"] == "stopped"
+            and row["session_hash"] is not None
+            and hmac.compare_digest(bytes(row["session_hash"]), token.secret_hash)
+        ):
+            raise SessionExpired("this worker's session expired (nothing heard from it for too long); register again")
+        raise Unauthorized("invalid or revoked worker token")
 
     async def authenticate(self, token: tokens.ParsedToken, *, claiming: bool = False) -> Session:
         async with await self._connect() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
@@ -489,14 +516,21 @@ class RemoteRepository:
         Idle means no call for ``max(2 × lease_ttl, claim_wait + lease_ttl)``. A worker
         waiting in a claim long-poll makes no call for up to ``claim_wait`` seconds, so
         the threshold always leaves a full lease TTL of slack after the longest
-        long-poll. A draining worker stops as soon as it holds no live lease. Their
-        tokens stop working.
+        long-poll. A draining worker stops as soon as it holds no live lease.
+
+        Their tokens stop working. An idle worker's session is only expired, not
+        revoked: it keeps its hash, so its next call gets ``session_expired`` and it
+        registers again. Idleness is often the network's or the server's fault (an
+        outage longer than the threshold), and a worker that comes back must not stay
+        out for good. A drained worker's hash is cleared: it was retired on purpose.
         """
         async with await self._connect() as conn, conn.cursor() as cur:
             await cur.execute(
                 SQL("""
                     UPDATE {w} w
-                    SET status = 'stopped', session_hash = NULL, expires_at = NOW() + INTERVAL '1 hour'
+                    SET status = 'stopped',
+                        session_hash = CASE WHEN w.status = 'draining' THEN NULL ELSE w.session_hash END,
+                        expires_at = NOW() + INTERVAL '1 hour'
                     WHERE w.role = 'remote'
                       AND w.status IN ('active', 'draining')
                       AND (w.status = 'draining'

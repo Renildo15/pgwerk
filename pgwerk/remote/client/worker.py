@@ -85,6 +85,7 @@ class RemoteWorker:
         self._stopping = asyncio.Event()
         self._draining = False
         self._revoked = False
+        self._expired = False
         self._claims: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
@@ -94,10 +95,11 @@ class RemoteWorker:
     async def run(self) -> None:
         """Register, then process jobs until :meth:`stop`, SIGTERM/SIGINT, or revocation.
 
-        On the way out it finishes running jobs, then deregisters (jobs it still
-        holds go back to the queue).
+        If the server expires this worker's session (it heard nothing from it for too
+        long, e.g. during an outage), the worker registers again and carries on. On
+        the way out it finishes running jobs, then deregisters (jobs it still holds go
+        back to the queue).
         """
-        await self._register()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -105,10 +107,24 @@ class RemoteWorker:
             except (NotImplementedError, ValueError, RuntimeError):
                 pass
         try:
-            slots = [asyncio.create_task(self._slot(i)) for i in range(self.concurrency)]
-            await asyncio.gather(*slots)
+            if not await self._register():
+                return
+            while True:
+                self._expired = False
+                slots = [asyncio.create_task(self._slot(i)) for i in range(self.concurrency)]
+                await asyncio.gather(*slots)
+                if not self._expired or self._stopping.is_set() or self._revoked:
+                    break
+                logger.warning(
+                    "remote worker %s: the server expired this session (it heard nothing from us for too long); "
+                    "registering again",
+                    self.name,
+                )
+                self._draining = False
+                if not await self._register():
+                    return
         finally:
-            if not self._revoked:
+            if self.worker_id is not None and not self._revoked and not self._expired:
                 try:
                     await self._client.call("/deregister", self._token or "")
                 except Exception as exc:
@@ -122,7 +138,14 @@ class RemoteWorker:
         for task in list(self._claims):
             task.cancel()
 
-    async def _register(self) -> None:
+    def _expire(self) -> None:
+        """The session expired: end it (running jobs lost their leases) and register again."""
+        self._expired = True
+        for task in list(self._claims):
+            task.cancel()
+
+    async def _register(self) -> bool:
+        """Register, retrying while the server is unreachable. ``False`` if stopped meanwhile."""
         body = {
             "name": self.name,
             "queues": self.queues,
@@ -132,6 +155,8 @@ class RemoteWorker:
         }
         delay = 1.0
         while True:
+            if self._stopping.is_set():
+                return False
             try:
                 _, reg = await self._client.call("/register", self._enrollment, body)
                 break
@@ -141,13 +166,14 @@ class RemoteWorker:
                 if not exc.retryable:
                     raise
                 logger.warning("remote worker %s: register failed (%s), retrying in %.0fs", self.name, exc, delay)
-            await asyncio.sleep(delay)
+            await self._sleep(delay)
             delay = min(delay * 2, 30.0)
         self.worker_id = reg["worker_id"]
         self._token = reg["worker_token"]
         self.lease_ttl = reg.get("lease_ttl", 60)
         self.claim_wait = reg.get("claim_wait", 30)
         logger.info("remote worker %s registered as %s", self.name, self.worker_id)
+        return True
 
     # ------------------------------------------------------------------
     # Claim loop
@@ -156,7 +182,7 @@ class RemoteWorker:
     async def _slot(self, index: int) -> None:
         backoff = 1.0
         claim_id = str(uuid.uuid4())
-        while not self._stopping.is_set() and not self._draining:
+        while not self._stopping.is_set() and not self._draining and not self._expired:
             task = asyncio.create_task(
                 self._client.call(
                     "/claim",
@@ -169,7 +195,7 @@ class RemoteWorker:
             try:
                 status, body = await task
             except asyncio.CancelledError:
-                if self._stopping.is_set():
+                if self._stopping.is_set() or self._expired:
                     return
                 raise
             except httpx.TransportError as exc:
@@ -182,6 +208,9 @@ class RemoteWorker:
                 if exc.code == "draining":
                     logger.info("remote worker %s is draining: finishing held jobs", self.name)
                     self._draining = True
+                    return
+                if exc.code == "session_expired":
+                    self._expire()
                     return
                 if exc.status == 401:
                     self._revoke()
@@ -205,7 +234,7 @@ class RemoteWorker:
 
     def _revoke(self) -> None:
         if not self._revoked:
-            logger.error("remote worker %s: token no longer valid (revoked or expired); stopping", self.name)
+            logger.error("remote worker %s: token no longer valid (revoked or retired); stopping", self.name)
         self._revoked = True
         self.stop()
 
@@ -276,7 +305,9 @@ class RemoteWorker:
                 if exc.code == "lease_lost" or exc.status == 401:
                     lost.set()
                     run.cancel()
-                    if exc.status == 401:
+                    if exc.code == "session_expired":
+                        self._expire()
+                    elif exc.status == 401:
                         self._revoke()
                     return
                 logger.warning("remote worker %s: heartbeat error for %s: %s", self.name, job.id, exc)
@@ -320,6 +351,10 @@ class RemoteWorker:
                     continue
                 if exc.code == "lease_lost":
                     logger.warning("remote worker %s: job %s lost its lease; result dropped", self.name, job.id)
+                    return
+                if exc.code == "session_expired":
+                    logger.warning("remote worker %s: session expired; result of job %s dropped", self.name, job.id)
+                    self._expire()
                     return
                 if exc.status == 401:
                     self._revoke()
