@@ -122,8 +122,8 @@ class DatabaseManager:
                 "WHERE status IN ('queued', 'scheduled')"
             ).format(idx=idx("jobs_dequeue_partial_idx"), jobs=t("jobs")),
             # Partial index — stale active job recovery ("steal") in the dequeue of workers
-            # older than schema 8. Kept for rolling deploys; drop it once
-            # min_compatible_db_version moves past 8.
+            # older than schema 8. Kept for rolling deploys; drop it once those workers can no
+            # longer run (they don't check the schema: up to 0.1.26 their max is unbounded).
             SQL(
                 "CREATE INDEX IF NOT EXISTS {idx} ON {jobs} (queue, worker_id, heartbeat_secs, touched_at, started_at) "
                 "WHERE status = 'active'"

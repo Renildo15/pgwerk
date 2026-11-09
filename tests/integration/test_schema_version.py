@@ -92,6 +92,20 @@ class TestConnectVersionGate:
             await observer.disconnect()
 
     @pytest.mark.asyncio
+    async def test_auto_migrate_false_refuses_the_previous_schema(self, app, restore_version):
+        """This build reads and writes the columns its own migration adds.
+
+        Regression: min_compatible_db_version stayed at 6 while the schema moved on, so a
+        process with auto_migrate=False (the API pod, per RELEASES.md's upgrade flow)
+        connected to an unmigrated database and failed later, on its first query.
+        """
+        await _set_db_version(WerkConfig.schema_version - 1)
+        observer = Werk(_TEST_DSN, prefix=_TEST_PREFIX, auto_migrate=False)
+        with pytest.raises(SchemaVersionMismatch, match=r"requires >="):
+            await observer.connect()
+        assert observer._connected is False
+
+    @pytest.mark.asyncio
     async def test_auto_migrate_false_refuses_old_db(self, app, restore_version):
         await _set_db_version(WerkConfig.min_compatible_db_version - 1)
         observer = Werk(_TEST_DSN, prefix=_TEST_PREFIX, auto_migrate=False)

@@ -70,7 +70,10 @@ class WerkConfig:
     """
 
     schema_version: ClassVar[int] = 8
-    min_compatible_db_version: ClassVar[int] = 6
+    # This build reads and writes the lease columns schema 8 adds, so it refuses an
+    # older database instead of failing on its first query. Workers older than schema 8
+    # are unaffected: what they accept is set by their own max (unbounded up to 0.1.26).
+    min_compatible_db_version: ClassVar[int] = 8
     # From schema 8 on, every release declares the newest schema it tolerates, so a
     # later breaking migration can stop older code from running against it. It covers
     # the additive migrations already planned (9: function routing, 10: remote
