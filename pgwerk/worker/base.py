@@ -113,14 +113,18 @@ class BaseWorker(abc.ABC):
         self.name = f"{socket.gethostname()}.{os.getpid()}"
         self._running = False
         self._active: set[asyncio.Task] = set()
+        # The running attempt of each job ({job_id: task}). The same worker can claim a
+        # job again while a stale attempt of it still runs (the job was requeued under
+        # it), so per-attempt state is keyed by the attempt's task, and each attempt
+        # only ever removes its own entries.
         self._active_jobs: dict[str, asyncio.Task] = {}
-        self._abort_requested: set[str] = set()
+        self._abort_requested: set[asyncio.Task] = set()
         # Leases this worker still holds ({job_id: lease_id}); an entry is removed as
         # soon as the attempt starts settling, so renewal never races its own settle.
         self._leases: dict[str, str] = {}
         self._lease_ttls: dict[str, int] = {}
-        self._lease_lost: set[str] = set()
-        self._acknowledging_jobs: set[str] = set()
+        self._lease_lost: set[asyncio.Task] = set()
+        self._acknowledging: set[asyncio.Task] = set()
         self._wakeup = asyncio.Event()
         self._exception_handlers: list[Callable] = []
         self._rr_offset = 0
@@ -364,7 +368,7 @@ class BaseWorker(abc.ABC):
                         self.name,
                         job_id,
                     )
-                    self._lease_lost.add(job_id)
+                    self._lease_lost.add(task)
                     task.cancel()
 
     async def _abort_loop(self) -> None:
@@ -376,14 +380,14 @@ class BaseWorker(abc.ABC):
                 worker_repo = self.app._worker_repo
                 aborting = await worker_repo.get_aborting(list(self._active_jobs.keys()))
                 for job_id in aborting:
+                    task = self._active_jobs.get(job_id)
                     # The handler has returned: let the acknowledgement transaction
                     # settle the abort instead of cancelling persistence or callbacks.
-                    if job_id in self._abort_requested or job_id in self._acknowledging_jobs:
+                    if task is None or task in self._abort_requested or task in self._acknowledging:
                         continue
-                    task = self._active_jobs.get(job_id)
-                    if task and not task.done():
+                    if not task.done():
                         logger.info("Worker %s: aborting job %s", self.name, job_id)
-                        self._abort_requested.add(job_id)
+                        self._abort_requested.add(task)
                         task.cancel()
             except Exception as exc:
                 logger.warning("Worker %s: abort loop error: %s", self.name, exc)
@@ -404,6 +408,29 @@ class BaseWorker(abc.ABC):
     # Main loop
     # ------------------------------------------------------------------
 
+    def _supersede(self, job_id: str) -> None:
+        """Cancel a stale attempt of a job this worker just claimed again.
+
+        The claim gave the job a new lease, so the attempt still running here has lost
+        its own: cancel it without writing anything, exactly as when a renewal finds the
+        lease gone. An attempt already acknowledging is left alone; the fence rejects
+        its write.
+        """
+        stale = self._active_jobs.get(job_id)
+        if stale is None or stale.done() or stale in self._acknowledging:
+            return
+        logger.warning(
+            "Worker %s: claimed job %s again while a stale attempt of it was running; cancelling that attempt",
+            self.name,
+            job_id,
+        )
+        self._lease_lost.add(stale)
+        stale.cancel()
+
+    def _forget_task(self, job_id: str, task: asyncio.Task) -> None:
+        if self._active_jobs.get(job_id) is task:
+            del self._active_jobs[job_id]
+
     async def _main_loop(self) -> None:
         try:
             while self._running:
@@ -417,12 +444,13 @@ class BaseWorker(abc.ABC):
                         return
 
                     for job in jobs:
+                        self._supersede(job.id)
                         task = asyncio.create_task(self._handle_job(job))
                         self._active.add(task)
                         task.add_done_callback(self._active.discard)
                         task.add_done_callback(lambda _: self._wakeup.set())
                         self._active_jobs[job.id] = task
-                        task.add_done_callback(lambda _, jid=job.id: self._active_jobs.pop(jid, None))  # type: ignore[misc]
+                        task.add_done_callback(lambda t, jid=job.id: self._forget_task(jid, t))  # type: ignore[misc]
 
                 try:
                     jittered = self.poll_interval * (1 + random.uniform(-0.2, 0.2))
@@ -508,6 +536,7 @@ class BaseWorker(abc.ABC):
             job.max_attempts,
         )
         ctx = Context(app=self.app, worker=self, job=job)
+        me = asyncio.current_task()
         if job.lease_id is not None:
             self._leases[job.id] = job.lease_id
             self._lease_ttls[job.id] = job.heartbeat_secs or self.app.config.local_lease_ttl
@@ -522,11 +551,11 @@ class BaseWorker(abc.ABC):
 
                 result = await self._execute(job, ctx)
             except asyncio.CancelledError:
-                self._leases.pop(job.id, None)
-                if job.id in self._lease_lost:
+                self._release_lease(job)
+                if me in self._lease_lost:
                     # The sweep recovered the job; another attempt owns it now.
                     return
-                if job.id in self._abort_requested:
+                if me in self._abort_requested:
                     await self._nack(job, "aborted", aborted=True)
                 else:
                     await self._requeue_cancelled(job)
@@ -544,12 +573,13 @@ class BaseWorker(abc.ABC):
                     exc_info=True,
                 )
                 await self._invoke_exception_handlers(job, exc)
-                self._leases.pop(job.id, None)
+                self._release_lease(job)
                 await self._nack(job, traceback.format_exc())
                 return
 
-            self._leases.pop(job.id, None)
-            self._acknowledging_jobs.add(job.id)
+            self._release_lease(job)
+            if me is not None:
+                self._acknowledging.add(me)
             # The handler has returned. Finish persistence even if a drain timeout
             # cancels this task; requeueing here would execute its side effects again.
             ack_task = asyncio.create_task(self._ack_with_retry(job, result))
@@ -561,10 +591,10 @@ class BaseWorker(abc.ABC):
                     if ack_task.cancelled():
                         raise
         except asyncio.CancelledError:
-            if job.id in self._acknowledging_jobs:
+            if me in self._acknowledging:
                 raise
-            self._leases.pop(job.id, None)
-            if job.id not in self._lease_lost:
+            self._release_lease(job)
+            if me not in self._lease_lost:
                 await self._requeue_cancelled(job)
         finally:
             try:
@@ -575,11 +605,20 @@ class BaseWorker(abc.ABC):
                     except Exception:
                         logger.exception("Worker %s: after_process hook error", self.name)
             finally:
-                self._acknowledging_jobs.discard(job.id)
-                self._abort_requested.discard(job.id)
-                self._leases.pop(job.id, None)
+                if me is not None:
+                    self._acknowledging.discard(me)
+                    self._abort_requested.discard(me)
+                    self._lease_lost.discard(me)
+                self._release_lease(job, ttl=True)
+
+    def _release_lease(self, job: Job, ttl: bool = False) -> None:
+        """Stop renewing this attempt's lease, never another attempt's of the same job."""
+        if job.lease_id is None or self._leases.get(job.id) == job.lease_id:
+            self._leases.pop(job.id, None)
+            if ttl:
                 self._lease_ttls.pop(job.id, None)
-                self._lease_lost.discard(job.id)
+        elif ttl and job.id not in self._leases:
+            self._lease_ttls.pop(job.id, None)
 
     @abc.abstractmethod
     async def _execute(self, job: Job, ctx: Context) -> Any:
