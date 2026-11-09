@@ -38,6 +38,7 @@ from .longpoll import Waiters
 from ..repository import ClaimSpent
 from ...settlement import Outcome
 from ...serializers import JSONSerializer
+from ...serializers import encode_plain
 
 
 if TYPE_CHECKING:
@@ -246,10 +247,13 @@ async def complete(request: Request, remote: RemoteServer, lease_id: str) -> dic
     cfg = remote.config
     token = _token(request, "worker")
     body = await _json(request, cfg.remote_max_result_bytes + 1024)
-    result_json = json.dumps(body.get("result"))
-    if len(result_json.encode()) > cfg.remote_max_result_bytes:
+    result = body.get("result")
+    if len(json.dumps(result).encode()) > cfg.remote_max_result_bytes:
         raise TooLarge(f"result over {cfg.remote_max_result_bytes} bytes; report it as a non-retryable failure")
-    reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), Outcome("complete", result_json))
+    # Stored in an envelope that decode() returns as is: a result from an untrusted
+    # worker must never reach the app's serializer in any process that reads the job.
+    outcome = Outcome("complete", encode_plain(result))
+    reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
     if reported.settled:
         remote.run_callbacks([reported.settled])
     return {"status": reported.status}

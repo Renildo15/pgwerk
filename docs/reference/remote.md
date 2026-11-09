@@ -32,6 +32,9 @@ werk api --dsn "$DSN" --remote-workers --no-api
 - **Callbacks** (`on_success`, `on_failure`, `on_stopped`) of jobs that remote workers settle run in
   the server process, in the background. The callbacks' modules must be importable there.
 - **Producers must use the JSON serializer.** The remote protocol is JSON only.
+- **Remote results are stored in an envelope**, `{"__pgwerk_json__": <result>}`, which pgwerk's readers unwrap.
+  The envelope tells them never to hand the value to the app's serializer: an app or CLI that reads jobs with
+  `PickleSerializer` can't be made to unpickle bytes a remote worker chose. Raw SQL readers see the envelope.
 - **Scaling:** several replicas can run side by side (`SKIP LOCKED` keeps claims apart). The claim
   rate limit applies per replica.
 - **Unlogged worker table:** with `ephemeral_tables=True`, worker sessions are lost if Postgres

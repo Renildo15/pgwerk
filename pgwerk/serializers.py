@@ -203,24 +203,47 @@ def encode(serializer: "Serializer", value: Any) -> str | None:
     return json.dumps(serializer.dumps(value))
 
 
+#: Key of the envelope that marks a value as plain JSON from an untrusted source (a
+#: remote worker's result). :func:`decode` returns what it holds as is and never hands
+#: it to the app's serializer, which may be pickle.
+PLAIN_JSON_KEY = "__pgwerk_json__"
+
+
+def encode_plain(value: Any) -> str:
+    """Encode an untrusted JSON value so that :func:`decode` never deserializes it as code."""
+    return json.dumps({PLAIN_JSON_KEY: value})
+
+
+def _plain(value: Any) -> tuple[bool, Any]:
+    if isinstance(value, dict) and len(value) == 1 and PLAIN_JSON_KEY in value:
+        return True, value[PLAIN_JSON_KEY]
+    return False, None
+
+
 def decode(serializer: "Serializer", value: Any) -> Any:
-    """Decode a JSONB-stored value produced by :func:`encode`.
+    """Decode a JSONB-stored value produced by :func:`encode` or :func:`encode_plain`.
 
     Args:
         serializer: Serializer instance used to deserialize the inner payload.
-        value: Raw value from the database — may be ``None``, ``bytes``, or a
-            JSON string.
+        value: Raw value from the database — may be ``None``, ``bytes``, a JSON
+            string, or a value psycopg already parsed.
 
     Returns:
         The decoded Python object, or ``None`` if *value* is ``None``.
     """
     if value is None:
         return None
+    plain, inner = _plain(value)
+    if plain:
+        return inner
     if isinstance(value, bytes):
         value = value.decode()
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
+            plain, inner = _plain(parsed)
+            if plain:
+                return inner
         except json.JSONDecodeError:
             try:
                 return serializer.loads(value)

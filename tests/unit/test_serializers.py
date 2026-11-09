@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import datetime
 import decimal
 import uuid
@@ -240,3 +241,17 @@ class TestEncodeDecodeHelpers:
         outer = json.dumps("hello")
         result = decode(s, outer)
         assert result == "hello"
+
+
+class TestPlainJsonEnvelope:
+    """Untrusted JSON (a remote worker's result) never reaches the app's serializer."""
+
+    def test_decode_returns_the_wrapped_value_as_is(self):
+        from pgwerk.serializers import PickleSerializer
+        from pgwerk.serializers import decode
+        from pgwerk.serializers import encode_plain
+
+        for value in ("gASVaW5qZWN0ZWQ=", {"a": [1, "x"]}, [1, 2], 3, None, True):
+            text = encode_plain(value)
+            assert decode(PickleSerializer(), text) == value  # as stored text
+            assert decode(PickleSerializer(), json.loads(text)) == value  # as psycopg returns JSONB
