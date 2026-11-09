@@ -37,6 +37,10 @@ werk api --dsn "$DSN" --remote-workers --no-api
   `PickleSerializer` can't be made to unpickle bytes a remote worker chose. Raw SQL readers see the envelope.
 - **Scaling:** several replicas can run side by side (`SKIP LOCKED` keeps claims apart). The claim
   rate limit applies per replica.
+- **Database connections:** the API process holds at most `pool_size` connections (20 by default,
+  `PGWERK_POOL_SIZE`), plus one `LISTEN` connection, however many workers are connected. Waiting
+  claims hold none. An enqueue wakes one waiting worker per group (workers that declared the same
+  functions); a worker that gets a job wakes the next one, so a burst still reaches every idle worker.
 - **Unlogged worker table:** with `ephemeral_tables=True`, worker sessions are lost if Postgres
   crashes, and remote workers must register again.
 

@@ -65,13 +65,18 @@ class TestWaiters:
             assert not await _waited(event, 1.0)
         assert waiters.waiting_queues() == set()
 
-    async def test_wakes_all_waiters_on_the_queue(self, app):
+    async def test_notify_wakes_one_waiter_per_group(self, app):
         waiters = Waiters(app._connect, app.prefix, app._t["jobs"], tick=60)
         await waiters.start()
         try:
-            async with waiters.subscribe(["lp-all"]) as e1, waiters.subscribe(["lp-all"]) as e2:
+            async with (
+                waiters.subscribe(["lp-all"], ["a"]) as a1,
+                waiters.subscribe(["lp-all"], ["a"]) as a2,
+                waiters.subscribe(["lp-all"], ["b"]) as b1,
+            ):
                 await asyncio.sleep(0.8)
                 await app.enqueue(noop, _queue="lp-all")
-                assert await _waited(e1, 1.0) and await _waited(e2, 1.0)
+                assert await _waited(a1, 1.0) and await _waited(b1, 1.0)
+                assert not a2.is_set()  # the next one of group "a" waits for a chain or the tick
         finally:
             await waiters.stop()

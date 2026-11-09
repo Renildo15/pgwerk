@@ -163,3 +163,109 @@ class TestConnectionPool:
 
         assert API_POOL_SIZE == 20
         assert _config(app).pool_size is None  # unset: the API applies its default
+
+
+@pytest.fixture
+def live_server(app):
+    """A real server (uvicorn in a thread): the test client can't serve concurrent requests."""
+    import time
+    import socket
+    import threading
+
+    import uvicorn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    srv = uvicorn.Server(
+        uvicorn.Config(
+            create_app(_config(app, api=False, api_token=None)),
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+            timeout_graceful_shutdown=1,
+        )
+    )
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if srv.started:
+            break
+        time.sleep(0.05)
+    yield f"http://127.0.0.1:{port}"
+    srv.should_exit = True
+    thread.join(10)
+
+
+class TestOneWakePerGroup:
+    """Regression: one enqueue woke every idle long-poll, and each ran a full claim
+    transaction (and, before the pool, opened a connection): 50 idle workers cost about
+    124 transactions per enqueue."""
+
+    async def test_one_enqueue_costs_a_couple_of_claims_not_one_per_idle_worker(self, app, live_server, monkeypatch):
+        import asyncio
+
+        import httpx
+
+        from pgwerk.remote.repository import RemoteRepository
+
+        calls = 0
+        original = RemoteRepository.claim
+
+        async def counting(self, *a, **kw):
+            nonlocal calls
+            calls += 1
+            return await original(self, *a, **kw)
+
+        monkeypatch.setattr(RemoteRepository, "claim", counting)
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        async with httpx.AsyncClient(base_url=f"{live_server}/remote/v1", timeout=20) as http:
+            tokens = []
+            for i in range(20):
+                resp = await http.post(
+                    "/register",
+                    headers=_h(enrollment),
+                    json={"name": f"w{i}", "queues": ["default"], "functions": [{"name": NOOP}]},
+                )
+                assert resp.status_code == 201, resp.text
+                tokens.append(resp.json()["worker_token"])
+
+            async def poll(token):
+                return await http.post("/claim", headers=_h(token), json={"claim_id": str(uuid.uuid4()), "wait": 8})
+
+            polls = [asyncio.create_task(poll(t)) for t in tokens]
+            await asyncio.sleep(1.5)  # every request made its first, empty claim and waits
+            calls = 0
+            await app.enqueue(noop)
+            await asyncio.sleep(1.0)
+            woken_claims = calls
+            results = await asyncio.gather(*polls)
+
+        assert sum(r.status_code == 200 for r in results) == 1
+        assert woken_claims <= 3, f"{woken_claims} claims for one enqueue with 20 idle workers"
+
+    async def test_a_burst_still_reaches_every_idle_worker(self, app, live_server):
+        import asyncio
+
+        import httpx
+
+        enrollment, _ = await app.create_enrollment_token("box", ["default"])
+        async with httpx.AsyncClient(base_url=f"{live_server}/remote/v1", timeout=20) as http:
+            tokens = []
+            for i in range(10):
+                resp = await http.post(
+                    "/register",
+                    headers=_h(enrollment),
+                    json={"name": f"w{i}", "queues": ["default"], "functions": [{"name": NOOP}]},
+                )
+                tokens.append(resp.json()["worker_token"])
+            polls = [
+                asyncio.create_task(http.post("/claim", headers=_h(t), json={"claim_id": str(uuid.uuid4()), "wait": 8}))
+                for t in tokens
+            ]
+            await asyncio.sleep(1.0)
+            for _ in range(10):
+                await app.enqueue(noop)
+            results = await asyncio.wait_for(asyncio.gather(*polls), 6)
+
+        assert sum(r.status_code == 200 for r in results) == 10  # the chain fanned out to all

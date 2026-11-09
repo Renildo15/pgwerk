@@ -209,7 +209,7 @@ async def claim(request: Request, remote: RemoteServer) -> Response:
 
     session = await remote.repo.authenticate(token, claiming=True)
     deadline = time.monotonic() + wait
-    async with remote.waiters.subscribe(session.queues) as woken:
+    async with remote.waiters.subscribe(session.queues, session.functions) as woken:
         while True:
             woken.clear()
             try:
@@ -218,6 +218,8 @@ async def claim(request: Request, remote: RemoteServer) -> Response:
                 return Response(content=None, status_code=204)
             if claimed is not None:
                 job = claimed.job
+                # There may be more work: let the next waiting worker of this group try.
+                remote.waiters.chain(job.queue, session.functions)
                 return Response(
                     content={
                         "job": _job_body(job),
