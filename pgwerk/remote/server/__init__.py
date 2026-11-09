@@ -18,11 +18,14 @@ import logging
 from typing import TYPE_CHECKING
 from typing import Any
 
+import psycopg
+
 from litestar import Router
 from litestar import Request
 from litestar import Response
 from litestar import post
 from litestar.di import Provide
+from litestar.exceptions import HTTPException
 
 from .. import tokens
 from ..errors import Scope
@@ -41,6 +44,7 @@ from .limits import MAX_PROGRESS_BYTES
 from .limits import TokenBucket
 from .limits import read_body
 from .limits import clean_text
+from .limits import error_json
 from .limits import truncate_error
 from .longpoll import Waiters
 from ..repository import ClaimSpent
@@ -128,6 +132,8 @@ async def _json(request: Request, limit: int) -> dict[str, Any]:
         data = json.loads(body)
     except ValueError:
         raise RemoteError("body is not valid JSON") from None
+    except RecursionError:
+        raise RemoteError("body is nested too deeply") from None
     if not isinstance(data, dict):
         raise RemoteError("body must be a JSON object")
     return data
@@ -166,8 +172,38 @@ def _job_body(job: "Job") -> dict[str, Any]:
     }
 
 
+def _protocol_error(status: int, code: str, message: str) -> Response:
+    return Response(content={"error": {"code": code, "message": message}}, status_code=status)
+
+
 def _error_response(_: Request, exc: RemoteError) -> Response:
-    return Response(content={"error": {"code": exc.code, "message": exc.message}}, status_code=exc.status_code)
+    return _protocol_error(exc.status_code, exc.code, exc.message)
+
+
+def _unexpected_error(request: Request, exc: Exception) -> Response:
+    """Everything else, still in the protocol's error shape (clients branch on ``code``).
+
+    A database outage is a retryable 503 logged as one line, not a traceback per
+    request; data Postgres can't store (NUL characters) and over-deep JSON are the
+    client's 400, so it doesn't retry a request that can never succeed.
+    """
+    if isinstance(exc, HTTPException):
+        if exc.status_code == 413:
+            return _protocol_error(413, "too_large", "request body too large")
+        if exc.status_code == 404:
+            return _protocol_error(404, "not_found", str(exc.detail))
+        if exc.status_code < 500:
+            return _protocol_error(exc.status_code, "bad_request", str(exc.detail))
+        return _protocol_error(exc.status_code, "internal", "internal error")
+    if isinstance(exc, RecursionError):
+        return _protocol_error(400, "bad_request", "body is nested too deeply")
+    if isinstance(exc, psycopg.DataError):
+        return _protocol_error(400, "bad_request", f"the request holds data the server can't store: {exc}")
+    if isinstance(exc, psycopg.OperationalError):
+        logger.warning("remote: database unavailable on %s: %s", request.url.path, exc)
+        return _protocol_error(503, "internal", "database unavailable; retry")
+    logger.exception("remote: unexpected error on %s", request.url.path, exc_info=exc)
+    return _protocol_error(500, "internal", "internal error")
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -290,10 +326,12 @@ async def heartbeat(request: Request, remote: RemoteServer, lease_id: str) -> di
     token = _token(request, "worker")
     body = await _json(request, cfg.remote_max_payload_bytes)
     progress = body.get("progress")
-    if progress is not None and len(json.dumps(progress).encode()) > MAX_PROGRESS_BYTES:
-        # Renew the lease anyway: failing the heartbeat would lose a healthy job.
-        logger.info("remote: progress over %d bytes dropped for lease %s", MAX_PROGRESS_BYTES, lease_id)
-        progress = None
+    if progress is not None:
+        dumped = json.dumps(progress)
+        if len(dumped.encode()) > MAX_PROGRESS_BYTES or "\\u0000" in dumped:
+            # Renew the lease anyway: failing the heartbeat would lose a healthy job.
+            logger.info("remote: progress dropped for lease %s (over %d bytes or NUL)", lease_id, MAX_PROGRESS_BYTES)
+            progress = None
     expires_at, abort = await remote.repo.heartbeat(
         token, _uuid(lease_id, "lease_id"), cfg.remote_lease_ttl, progress=progress
     )
@@ -329,7 +367,7 @@ async def fail(request: Request, remote: RemoteServer, lease_id: str) -> dict[st
         if not isinstance(error, dict) or not isinstance(error.get("type"), str):
             raise RemoteError('error must be an object like {"type": ..., "message": ..., "stack": ...}')
         error = truncate_error(error, cfg.remote_max_error_bytes)
-        outcome = Outcome("fail", error=json.dumps(error), retryable=body.get("retryable", True) is not False)
+        outcome = Outcome("fail", error=error_json(error), retryable=body.get("retryable", True) is not False)
     reported = await remote.repo.report(token, _uuid(lease_id, "lease_id"), outcome)
     if reported.settled:
         remote.run_callbacks([reported.settled])
@@ -349,7 +387,7 @@ def make_remote_router(state: dict[str, Any]) -> Router:
         path="/remote/v1",
         route_handlers=[register, deregister, claim, heartbeat, complete, fail],
         dependencies={"remote": Provide(_remote, sync_to_thread=False)},
-        exception_handlers={RemoteError: _error_response},
+        exception_handlers={RemoteError: _error_response, Exception: _unexpected_error},
     )
 
 

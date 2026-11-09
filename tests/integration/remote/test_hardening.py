@@ -495,3 +495,115 @@ class TestSessionExpiry:
             finally:
                 worker.stop()
                 await asyncio.wait_for(run, 10)
+
+
+class TestServerSideFailuresUseTheProtocolShape:
+    """Regression: database outages, NUL bytes, deeply nested JSON and bugs answered a
+    bare 500 `{"detail": ...}` with a traceback in the log, outside the protocol's error
+    shape. A client then retried a request that could never succeed (NUL in a result)."""
+
+    async def test_database_unavailable_is_a_retryable_503(self, app, client, monkeypatch):
+        import psycopg
+
+        from pgwerk.remote.repository import RemoteRepository
+
+        reg = await _register(app, client)
+
+        async def down(self, *a, **kw):
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
+
+        monkeypatch.setattr(RemoteRepository, "authenticate", down)
+        resp = await _claim(client, reg["worker_token"])
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "internal"
+
+    async def test_an_unexpected_error_is_a_500_in_the_protocol_shape(self, app, client, monkeypatch):
+        from pgwerk.remote.repository import RemoteRepository
+
+        reg = await _register(app, client)
+
+        async def bug(self, *a, **kw):
+            raise RuntimeError("a bug")
+
+        monkeypatch.setattr(RemoteRepository, "claim", bug)
+        resp = await _claim(client, reg["worker_token"])
+        assert (resp.status_code, resp.json()["error"]["code"]) == (500, "internal")
+        assert "a bug" not in resp.text
+
+    async def test_nul_bytes_in_a_result_are_a_400_not_a_retry_loop(self, app, client):
+        reg = await _register(app, client)
+        await app.enqueue(noop)
+        claimed = (await _claim(client, reg["worker_token"])).json()
+        resp = await client.post(
+            f"/remote/v1/leases/{claimed['lease_id']}/complete",
+            headers=_h(reg["worker_token"]),
+            json={"result": "a\u0000b"},
+        )
+        assert (resp.status_code, resp.json()["error"]["code"]) == (400, "bad_request")
+
+    async def test_nul_bytes_in_progress_are_dropped_and_the_lease_renewed(self, app, client):
+        reg = await _register(app, client)
+        await app.enqueue(noop)
+        claimed = (await _claim(client, reg["worker_token"])).json()
+        resp = await client.post(
+            f"/remote/v1/leases/{claimed['lease_id']}/heartbeat",
+            headers=_h(reg["worker_token"]),
+            json={"progress": {"log": "x\u0000y"}},
+        )
+        assert resp.status_code == 200
+
+    async def test_deeply_nested_json_is_a_400(self, app, client):
+        reg = await _register(app, client)
+        body = '{"claim_id": "' + str(uuid.uuid4()) + '", "x": ' + "[" * 100_000 + "]" * 100_000 + "}"
+        resp = await client.post(
+            "/remote/v1/claim",
+            headers={**_h(reg["worker_token"]), "Content-Type": "application/json"},
+            content=body,
+        )
+        assert (resp.status_code, resp.json()["error"]["code"]) == (400, "bad_request")
+
+
+class TestStructuredErrorsAreBounded:
+    """Regression: error.type wasn't truncated (a 200 KB type was stored whole), the size
+    was measured on ASCII-escaped JSON so a long non-ASCII message was cut down to just the
+    marker, unknown keys were stored as is, and control characters reached terminals."""
+
+    async def test_stored_error_fits_the_limit_and_keeps_its_text(self, app):
+        import json
+
+        async with AsyncTestClient(app=create_app(_config(app, remote_max_error_bytes=8192))) as c:
+            reg = await _register(app, c)
+            job = await app.enqueue(noop)
+            claimed = (await _claim(c, reg["worker_token"])).json()
+            error = {
+                "type": "T" * 50_000,
+                "message": "é" * 20_000,
+                "stack": "line\n\tframe\x1b[31m\x07",
+                "junk": "J" * 30_000,
+            }
+            resp = await c.post(
+                f"/remote/v1/leases/{claimed['lease_id']}/fail",
+                headers=_h(reg["worker_token"]),
+                json={"error": error, "retryable": False},
+            )
+            assert resp.status_code == 200, resp.text
+        stored = (await app.get_job(job.id)).error
+        assert len(stored.encode()) <= 8192
+        parsed = json.loads(stored)
+        assert set(parsed) <= {"type", "message", "stack"}
+        assert len(parsed["type"]) <= 256
+        assert parsed["message"].startswith("é" * 1000), parsed["message"][:40]
+        assert "\x1b" not in parsed["stack"] and "\x07" not in parsed["stack"] and "\n\t" in parsed["stack"]
+
+
+def test_truncate_error_unit():
+    import json
+
+    from pgwerk.remote.server.limits import truncate_error
+
+    out = truncate_error({"type": "X" * 1000, "message": "ü" * 50_000, "extra": 1}, 4096)
+    assert len(json.dumps(out, ensure_ascii=False).encode()) <= 4096
+    assert set(out) == {"type", "message"} and len(out["type"]) == 256
+    assert out["message"].startswith("ü" * 100) and out["message"].endswith("…[truncated]")
+    small = {"type": "E", "message": "ok\nnext\ttab"}
+    assert truncate_error(small, 4096) == small

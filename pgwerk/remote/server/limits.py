@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 import time
 
 from typing import Any
@@ -32,20 +33,61 @@ async def read_body(request: Request, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def truncate_error(error: dict[str, Any], limit: int) -> dict[str, Any]:
-    """Shrink a structured error to fit *limit* bytes of JSON; errors are truncated, not rejected."""
-    import json
+MAX_ERROR_TYPE = 256
+_TRUNCATED = "…[truncated]"
+# Control characters, except tab and newlines (stack traces keep their layout).
+_ERROR_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
-    error = dict(error)
-    for field in ("stack", "message"):
-        while len(json.dumps(error)) > limit and error.get(field):
-            text = str(error[field])
-            cut = max(0, len(text) - (len(json.dumps(error)) - limit) - 32)
-            error[field] = text[:cut] + "…[truncated]"
-            if cut == 0:
-                error[field] = "…[truncated]"
-                break
-    return error
+
+def error_json(error: dict[str, Any]) -> str:
+    """How a structured error is stored: UTF-8 JSON, the form its size limit applies to."""
+    return json.dumps(error, ensure_ascii=False)
+
+
+def truncate_error(error: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Shrink a structured error to fit *limit* bytes of stored JSON; errors are truncated, not rejected.
+
+    Only ``type``, ``message`` and ``stack`` are kept, ``type`` is cut at 256 characters,
+    and control characters other than tab and newlines are removed (they would reach
+    operators' terminals). ``message`` and ``stack`` are cut to fit, measured in UTF-8
+    bytes of the stored form; when both are long, each keeps about half.
+    """
+    out: dict[str, Any] = {}
+    for field in ("type", "message", "stack"):
+        if error.get(field) is not None:
+            out[field] = _ERROR_CONTROL.sub("", str(error[field]))
+    out["type"] = out.get("type", "")[:MAX_ERROR_TYPE]
+
+    def content_bytes(text: str) -> int:  # stored size of a string, without its quotes
+        return len(json.dumps(text, ensure_ascii=False).encode()) - 2
+
+    def cut(text: str, budget: int) -> str:
+        """The longest prefix of *text* that, with the marker, takes at most *budget* bytes."""
+        if content_bytes(text) <= budget:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if content_bytes(text[:mid] + _TRUNCATED) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + _TRUNCATED if content_bytes(_TRUNCATED) <= budget else ""
+
+    message, stack = out.get("message"), out.get("stack")
+    if len(error_json(out).encode()) > limit:
+        overhead = len(error_json({**out, **{k: "" for k in ("message", "stack") if k in out}}).encode())
+        room = max(0, limit - overhead)
+        need_m = content_bytes(message) if message else 0
+        need_s = content_bytes(stack) if stack else 0
+        # Each gets up to half; what one doesn't need goes to the other.
+        give_m = min(need_m, max(room // 2, room - need_s))
+        give_s = room - give_m
+        if message:
+            out["message"] = cut(message, give_m)
+        if stack:
+            out["stack"] = cut(stack, give_s)
+    return out
 
 
 class TokenBucket:
