@@ -6,6 +6,7 @@ import logging
 
 from typing import Any
 from typing import Callable
+from typing import Awaitable
 from typing import Sequence
 from typing import TYPE_CHECKING
 from typing import cast
@@ -47,6 +48,7 @@ from .schemas import JobExecution
 from .schemas import EnqueueParams
 from .database import DatabaseManager
 from .settlement import Settlement
+from .pool import ConnectionPool
 from .connection import Connect
 from .connection import AsyncConnection
 from .exceptions import JobError
@@ -77,6 +79,7 @@ class Werk:
         log_color: bool | None = None,
         log_fmt: str | None = None,
         auto_migrate: bool = True,
+        pool_size: int | None = None,
     ) -> None:
         """Initialize Werk with a Postgres DSN and optional configuration.
 
@@ -93,13 +96,25 @@ class Werk:
             log_format: Log output format (``"text"`` or ``"json"``).
             log_color: Enable ANSI colour in text log output.
             log_fmt: Custom log format string.
+            auto_migrate: Run schema migrations on :meth:`connect`.
+            pool_size: Hold at most this many database connections and reuse them,
+                from :meth:`connect` until :meth:`disconnect`. ``None`` (default,
+                or ``config.pool_size``) opens a connection per operation, which
+                suits workers and producers. Server processes set it: ``werk api``
+                uses 20.
         """
         if isinstance(config, dict):
             config = WerkConfig(**config)
         self.config: WerkConfig = config or WerkConfig()
 
         self.dsn = dsn
-        self._connect: Connect = cast(Connect, lambda: psycopg.AsyncConnection.connect(self.dsn, autocommit=True))
+        # A fresh connection; LISTEN connections always use this, never the pool.
+        self._direct_connect: Connect = cast(
+            Connect, lambda: psycopg.AsyncConnection.connect(self.dsn, autocommit=True)
+        )
+        self._pool_size = pool_size if pool_size is not None else self.config.pool_size
+        self._pool: ConnectionPool | None = None
+        self._connect: Connect = cast(Connect, self._open_connection)
         self.schema = schema if schema is not None else self.config.schema
         self.prefix = prefix if prefix is not None else self.config.prefix
         self.serializer: Serializer = serializer or JSONSerializer()
@@ -588,7 +603,7 @@ class Werk:
             backoff = 1.0
             while True:
                 try:
-                    async with await self._connect() as conn:
+                    async with await self._direct_connect() as conn:
                         await conn.execute(SQL("LISTEN {ch}").format(ch=Identifier(channel)))
                         backoff = 1.0
                         async for _ in conn.notifies():
@@ -1370,12 +1385,15 @@ class Werk:
         if self._connected:
             return
 
-        async with await self._connect() as conn:
+        async with await self._direct_connect() as conn:
             if self.auto_migrate:
                 await self._db.migrate(conn)
             if self.config.ephemeral_tables:
                 await self._db.alter_ephemeral_tables(conn)
             await self._db.check_version(conn)
+
+        if self._pool_size:
+            self._pool = ConnectionPool(self._direct_connect, self._pool_size)
 
         self._sync_worker = AsyncWorker(app=self, queues=[], concurrency=1)
         await self._sync_worker._setup_executor()
@@ -1395,7 +1413,16 @@ class Werk:
         if self._sync_worker is not None:
             await self._sync_worker._teardown_executor()
             self._sync_worker = None
+        if self._pool is not None:
+            pool, self._pool = self._pool, None
+            await pool.close()
         self._connected = False
+
+    def _open_connection(self) -> Awaitable[Any]:
+        """A connection for one operation: from the pool when there is one, else fresh."""
+        if self._pool is not None:
+            return self._pool()
+        return self._direct_connect()
 
     async def __aenter__(self) -> Werk:
         """Connect on entering the async context manager.

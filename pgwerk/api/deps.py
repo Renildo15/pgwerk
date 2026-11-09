@@ -8,6 +8,9 @@ from ..app import Werk
 from ..config import WerkConfig
 
 
+API_POOL_SIZE = 20
+
+
 async def _create_pgwerk(config: WerkConfig) -> Werk:
     """Create and connect a Werk instance.
 
@@ -24,6 +27,8 @@ async def _create_pgwerk(config: WerkConfig) -> Werk:
         prefix=config.prefix,
         auto_migrate=False,
         config=config,
+        # A server process must not open one Postgres backend per request.
+        pool_size=config.pool_size if config.pool_size is not None else API_POOL_SIZE,
     )
     await werk.connect()
     return werk

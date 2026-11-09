@@ -311,7 +311,7 @@ class BaseWorker(abc.ABC):
         backoff = 1.0
         while self._running:
             try:
-                conn = await self.app._connect()
+                conn = await self.app._direct_connect()
             except Exception as exc:
                 if not self._running:
                     return  # type: ignore[unreachable]

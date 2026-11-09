@@ -65,7 +65,13 @@ class RemoteServer:
         self.werk = werk
         self.config = config
         self.repo = werk._remote_repo
-        self.waiters = Waiters(werk._connect, werk.prefix, werk._t["jobs"], listen=config.listen)
+        self.waiters = Waiters(
+            werk._connect,
+            werk.prefix,
+            werk._t["jobs"],
+            listen=config.listen,
+            listen_connect=werk._direct_connect,
+        )
         self.bucket = TokenBucket(config.remote_claim_rate, config.remote_claim_burst)
         self._background: set[asyncio.Task] = set()
 

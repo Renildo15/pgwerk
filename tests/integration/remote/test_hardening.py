@@ -115,3 +115,51 @@ class TestRemoteResultsNeverReachTheAppSerializer:
         assert (await app.get_job(job_id)).result == {"uri": "s3://b/k.png", "size": 3}
         resp = await client.get(f"/api/jobs/{job_id}", headers={"Authorization": f"Bearer {ADMIN}"})
         assert resp.json()["result"] == {"uri": "s3://b/k.png", "size": 3}
+
+
+class TestConnectionPool:
+    """Regression: every operation opened a new Postgres backend. Under concurrent
+    remote requests the API process exhausted max_connections for the whole database."""
+
+    @staticmethod
+    async def _backends(dsn: str) -> int:
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            cur = await c.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            )
+            return (await cur.fetchone())[0]
+
+    async def test_a_pooled_werk_never_exceeds_its_pool(self, app):
+        import asyncio
+
+        job = await app.enqueue(noop)
+        baseline = await self._backends(app.dsn)
+        werk = Werk(app.dsn, prefix=app.prefix, auto_migrate=False, pool_size=4)
+        await werk.connect()
+        peak = 0
+        done = asyncio.Event()
+
+        async def sample():
+            nonlocal peak
+            while not done.is_set():
+                peak = max(peak, await self._backends(app.dsn) - baseline)
+                await asyncio.sleep(0.005)
+
+        sampler = asyncio.create_task(sample())
+        try:
+            await asyncio.gather(*(werk.get_job(job.id) for _ in range(60)))
+            await asyncio.gather(*(werk.enqueue(noop) for _ in range(20)))
+        finally:
+            done.set()
+            await sampler
+            await werk.disconnect()
+        assert 1 <= peak <= 4, peak
+        assert await self._backends(app.dsn) <= baseline  # disconnect closed them
+
+    def test_the_api_process_uses_a_pool_by_default(self, app):
+        from pgwerk.api.deps import API_POOL_SIZE
+
+        assert API_POOL_SIZE == 20
+        assert _config(app).pool_size is None  # unset: the API applies its default

@@ -34,8 +34,11 @@ class Waiters:
         *,
         listen: bool = True,
         tick: float = 2.0,
+        listen_connect: Any = None,
     ) -> None:
         self._connect = connect
+        # The LISTEN connection is held for the process's lifetime: never a pooled one.
+        self._listen_connect = listen_connect or connect
         self._prefix = prefix
         self._jobs = jobs_table
         self._listen = listen
@@ -112,7 +115,7 @@ class Waiters:
         prefix = f"{self._prefix}:"
         while self._running:
             try:
-                async with await self._connect() as conn:
+                async with await self._listen_connect() as conn:
                     listening: set[str] = set()
                     backoff = 1.0
                     while self._running:

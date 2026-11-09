@@ -51,6 +51,9 @@ class WerkConfig:
         ui: Serve the SPA dashboard (requires built static files).
         ui_auth: Basic Auth for the SPA as ``user:password``.
         api_token: Bearer token for all ``/api/*`` routes.
+        pool_size: Hold at most this many database connections and reuse them.
+            ``None`` opens one per operation (workers, producers); ``werk api``
+            uses 20 when unset, so it never opens a backend per request.
         maintenance: Run the maintenance pass (sweep, stranded ``waiting`` job
             reconciliation, rescheduling) inside the API process, every
             ``sweep_interval``. Lets stuck jobs recover with no worker running.
@@ -152,6 +155,10 @@ class WerkConfig:
     # Dangerous operations
     allow_truncate: bool = False
 
+    # Connections: hold at most this many and reuse them (None: one per operation).
+    # `werk api` defaults to 20 when unset.
+    pool_size: int | None = None
+
     @property
     def maintenance_enabled(self) -> bool:
         """Whether the API process runs maintenance (``maintenance``, or ``remote_workers`` if unset)."""
@@ -202,6 +209,7 @@ class WerkConfig:
             remote_lease_ttl=_int("PGWERK_REMOTE_LEASE_TTL", 60),
             default_max_lost=_int("PGWERK_DEFAULT_MAX_LOST", 3),
             allow_truncate=_bool("PGWERK_ALLOW_TRUNCATE", False),
+            pool_size=int(os.environ["PGWERK_POOL_SIZE"]) if os.environ.get("PGWERK_POOL_SIZE") else None,
             listen=_bool("PGWERK_LISTEN", True),
         )
 
@@ -243,4 +251,6 @@ class WerkConfig:
         os.environ["PGWERK_REMOTE_LEASE_TTL"] = str(self.remote_lease_ttl)
         os.environ["PGWERK_DEFAULT_MAX_LOST"] = str(self.default_max_lost)
         os.environ["PGWERK_ALLOW_TRUNCATE"] = "true" if self.allow_truncate else "false"
+        if self.pool_size is not None:
+            os.environ["PGWERK_POOL_SIZE"] = str(self.pool_size)
         os.environ["PGWERK_LISTEN"] = "true" if self.listen else "false"
