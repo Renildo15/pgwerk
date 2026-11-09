@@ -1173,7 +1173,7 @@ class Werk:
     async def expire_idle_remote_workers(self) -> int:
         """Stop remote workers that went quiet (no call for 2x ``remote_lease_ttl``) or
         finished draining, as long as they hold no live lease. Runs in maintenance."""
-        return await self._remote_repo.expire_idle(self.config.remote_lease_ttl)
+        return await self._remote_repo.expire_idle(self.config.remote_lease_ttl, self.config.remote_claim_wait)
 
     async def revoke_worker(self, worker_id: str, drain: bool = False) -> bool:
         """Retire one remote worker; with *drain*, let it finish the jobs it holds first.

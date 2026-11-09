@@ -286,3 +286,36 @@ class TestRemoteLeaseRecovery:
         await app._remote_repo.claim(wtoken, str(uuid.uuid4()), 60)
         assert await app.sweep() == []
 
+
+class TestIdleExpiryDuringLongPoll:
+    """Regression: idle expiry used 2 × lease TTL even when a claim long-poll lasts longer,
+    so a worker waiting in a long-poll was logged out mid-wait."""
+
+    @pytest.fixture
+    def short_ttl(self, app):
+        before = (app.config.remote_lease_ttl, app.config.remote_claim_wait)
+        app.config.remote_lease_ttl, app.config.remote_claim_wait = 10, 30
+        yield
+        app.config.remote_lease_ttl, app.config.remote_claim_wait = before
+
+    async def test_worker_inside_a_long_poll_is_not_expired(self, app, short_ttl):
+        enrollment, _ = await _enroll(app)
+        await _register(app, enrollment)
+        # Last call 25s ago: past 2 × TTL (20s), but a 30s long-poll may still be open.
+        await _sql(app, "UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '25 s'")
+        assert await app.expire_idle_remote_workers() == 0
+
+    async def test_worker_silent_past_a_long_poll_plus_ttl_is_expired(self, app, short_ttl):
+        enrollment, _ = await _enroll(app)
+        await _register(app, enrollment)
+        await _sql(app, "UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '45 s'")  # > 30s + 10s
+        assert await app.expire_idle_remote_workers() == 1
+
+    async def test_default_threshold_is_still_twice_the_ttl(self, app):
+        enrollment, _ = await _enroll(app)
+        await _register(app, enrollment)
+        assert (app.config.remote_lease_ttl, app.config.remote_claim_wait) == (60, 30)
+        await _sql(app, "UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '100 s'")
+        assert await app.expire_idle_remote_workers() == 0
+        await _sql(app, "UPDATE {w} SET heartbeat_at = NOW() - INTERVAL '125 s'")
+        assert await app.expire_idle_remote_workers() == 1

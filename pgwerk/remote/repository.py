@@ -449,11 +449,14 @@ class RemoteRepository:
             )
             return released
 
-    async def expire_idle(self, lease_ttl: int) -> int:
+    async def expire_idle(self, lease_ttl: int, claim_wait: int = 0) -> int:
         """Stop remote workers that hold no live lease and are idle or draining.
 
-        Idle means no call for ``2 × lease_ttl``. A draining worker stops as soon as
-        it holds no live lease. Their tokens stop working.
+        Idle means no call for ``max(2 × lease_ttl, claim_wait + lease_ttl)``. A worker
+        waiting in a claim long-poll makes no call for up to ``claim_wait`` seconds, so
+        the threshold always leaves a full lease TTL of slack after the longest
+        long-poll. A draining worker stops as soon as it holds no live lease. Their
+        tokens stop working.
         """
         async with await self._connect() as conn, conn.cursor() as cur:
             await cur.execute(
@@ -463,7 +466,7 @@ class RemoteRepository:
                     WHERE w.role = 'remote'
                       AND w.status IN ('active', 'draining')
                       AND (w.status = 'draining'
-                           OR w.heartbeat_at < NOW() - 2 * %(ttl)s * INTERVAL '1 second')
+                           OR w.heartbeat_at < NOW() - %(idle)s * INTERVAL '1 second')
                       AND NOT EXISTS (
                           SELECT 1 FROM {jobs} j
                           WHERE j.worker_id = w.id
@@ -471,6 +474,6 @@ class RemoteRepository:
                             AND j.lease_expires_at > NOW()
                       )
                 """).format(w=self._t["worker"], jobs=self._t["jobs"]),
-                {"ttl": lease_ttl},
+                {"idle": max(2 * lease_ttl, claim_wait + lease_ttl)},
             )
             return cur.rowcount
